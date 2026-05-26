@@ -3,7 +3,6 @@
 > A multi-agent stock analysis system powered by 11 specialist AI agents working in harmony to deliver comprehensive investment insights.
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12.4%2B-blue)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ## What is folio-gauge?
 
