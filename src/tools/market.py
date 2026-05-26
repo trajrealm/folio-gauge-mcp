@@ -9,11 +9,10 @@ from __future__ import annotations
 
 import yfinance as yf
 from pydantic import BaseModel
+from ..utils.logger import get_logger
 
+logger = get_logger(__name__)
 
-# ---------------------------------------------------------------------------
-# Output models
-# ---------------------------------------------------------------------------
 
 class CompanyProfile(BaseModel):
     symbol: str
@@ -54,7 +53,7 @@ class PriceSummary(BaseModel):
 
 class AnalystSummary(BaseModel):
     symbol: str
-    recommendation: str | None        # e.g. "buy", "hold", "sell"
+    recommendation: str | None  # e.g. "buy", "hold", "sell"
     target_mean_price: float | None
     target_high_price: float | None
     target_low_price: float | None
@@ -68,10 +67,6 @@ class TickerSnapshot(BaseModel):
     analysts: AnalystSummary
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def _safe(info: dict, key: str, cast=None):
     """Safely extract a value from yfinance info dict."""
     val = info.get(key)
@@ -80,14 +75,11 @@ def _safe(info: dict, key: str, cast=None):
     if cast:
         try:
             return cast(val)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as e:
+            logger.error(f"Error casting value {val}: {e}")
             return None
     return val
 
-
-# ---------------------------------------------------------------------------
-# Public functions
-# ---------------------------------------------------------------------------
 
 def get_profile(symbol: str) -> CompanyProfile:
     """Return basic company profile for a ticker."""

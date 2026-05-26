@@ -16,32 +16,29 @@ Start with:
 
 from __future__ import annotations
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import asyncio
 import os
-from dotenv import load_dotenv
-
-load_dotenv()
 
 import mcp.server.stdio
 import mcp.types as types
 from mcp.server import Server
 
-from src.agent.graph import run_analysis
+from src.agent.graph import run_analysis_with_analysts
 from src.tools.edgar import get_latest_filing_summary
 from src.tools.market import get_ticker_snapshot
 from src.tools.news import get_ticker_news, format_news_for_llm
+from src.orchestrator.aggregator import orchestrate_analysis, format_orchestrator_summary
+from src.orchestrator.evaluator import evaluate_consensus, format_evaluator_decision
+import json
 
 
-# ---------------------------------------------------------------------------
-# Server instance
-# ---------------------------------------------------------------------------
+load_dotenv()
 
 server = Server("folio-gauge")
 
-
-# ---------------------------------------------------------------------------
-# Tool definitions
-# ---------------------------------------------------------------------------
 
 @server.list_tools()
 async def list_tools() -> list[types.Tool]:
@@ -49,8 +46,9 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="analyze_ticker",
             description=(
-                "Analyze a single stock ticker using SEC filings, recent news, "
-                "and fundamental market data. Returns a structured analysis."
+                "Analyze a single stock ticker using the 11-agent orchestrator system. "
+                "Combines 9 core analysts (technical, fundamentals, sentiment, macro, peers, trends, "
+                "earnings, news, price_volume) plus orchestrator and evaluator consolidation layers."
             ),
             inputSchema={
                 "type": "object",
@@ -71,8 +69,8 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="analyze_portfolio",
             description=(
-                "Analyze a portfolio of stocks using SEC filings, recent news, "
-                "and fundamental data. Identifies cross-portfolio risks and themes."
+                "Analyze a portfolio of stocks using the 11-agent orchestrator system. "
+                "Combines analyst consensus for each ticker to identify cross-portfolio risks and themes."
             ),
             inputSchema={
                 "type": "object",
@@ -114,31 +112,85 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["symbol"],
             },
         ),
+        types.Tool(
+            name="get_analyst_scores",
+            description=(
+                "Get individual analyst scores for a ticker. "
+                "Returns scores from 9 core analysts: technical, fundamentals, sentiment, macro, "
+                "peers, trends, earnings, news, and price_volume."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "Stock ticker symbol e.g. AAPL",
+                    },
+                },
+                "required": ["symbol"],
+            },
+        ),
+        types.Tool(
+            name="get_orchestrator_consensus",
+            description=(
+                "Get aggregated orchestrator consensus for a ticker. "
+                "Returns weighted score, decision, conflicts, dissenters, and data gaps."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "Stock ticker symbol e.g. AAPL",
+                    },
+                },
+                "required": ["symbol"],
+            },
+        ),
+        types.Tool(
+            name="get_evaluator_decision",
+            description=(
+                "Get final evaluator decision with position sizing, stops, and targets. "
+                "Converts orchestrator consensus into actionable trading guidance."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "Stock ticker symbol e.g. AAPL",
+                    },
+                    "current_price": {
+                        "type": "number",
+                        "description": "Current stock price (for entry/stop/target calculation)",
+                        "default": 150.0,
+                    },
+                },
+                "required": ["symbol"],
+            },
+        ),
     ]
 
-
-# ---------------------------------------------------------------------------
-# Tool handlers
-# ---------------------------------------------------------------------------
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
     if name == "analyze_ticker":
         symbol = arguments["symbol"].upper()
-        question = arguments.get("question", "Give me a comprehensive analysis of this stock.")
-
-        result = await asyncio.to_thread(run_analysis, [symbol], question)
-
-        return [types.TextContent(type="text", text=result)]
+        
+        result = await asyncio.to_thread(run_analysis_with_analysts, [symbol])
+        orchestrator_result = result.get("orchestrator_result")
+        
+        if not orchestrator_result:
+            return [types.TextContent(type="text", text=f"Could not analyze {symbol}")]
+        
+        # Format as readable summary
+        summary = result.get("final_summary", "")
+        return [types.TextContent(type="text", text=summary)]
 
     elif name == "analyze_portfolio":
         symbols = [s.upper() for s in arguments["symbols"]]
-        question = arguments.get(
-            "question",
-            "What are the main risks and opportunities in this portfolio?"
-        )
-
+        
         if not symbols:
             return [types.TextContent(type="text", text="Error: no symbols provided.")]
 
@@ -147,10 +199,29 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 type="text",
                 text="Error: maximum 10 symbols per request to avoid rate limiting."
             )]
-
-        result = await asyncio.to_thread(run_analysis, symbols, question)
-
-        return [types.TextContent(type="text", text=result)]
+        
+        # Analyze each symbol and aggregate results
+        all_results = []
+        for symbol in symbols:
+            result = await asyncio.to_thread(run_analysis_with_analysts, [symbol])
+            if result.get("orchestrator_result"):
+                all_results.append({
+                    "symbol": symbol,
+                    "orchestrator_summary": result.get("orchestrator_summary", ""),
+                    "evaluator_summary": result.get("evaluator_summary", ""),
+                })
+        
+        if not all_results:
+            return [types.TextContent(type="text", text="Could not analyze portfolio")]
+        
+        # Format portfolio summary
+        summary_lines = [f"📊 PORTFOLIO ANALYSIS ({len(symbols)} positions)\n"]
+        for item in all_results:
+            summary_lines.append(f"\n--- {item['symbol']} ---")
+            summary_lines.append(item['orchestrator_summary'])
+            summary_lines.append(item['evaluator_summary'])
+        
+        return [types.TextContent(type="text", text="\n".join(summary_lines))]
 
     elif name == "get_sec_filing":
         symbol = arguments["symbol"].upper()
@@ -176,13 +247,59 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
         return [types.TextContent(type="text", text=text)]
 
+    elif name == "get_analyst_scores":
+        symbol = arguments["symbol"].upper()
+        
+        result = await asyncio.to_thread(run_analysis_with_analysts, [symbol])
+        orchestrator_result = result.get("orchestrator_result")
+        
+        if not orchestrator_result:
+            return [types.TextContent(type="text", text=f"Could not analyze {symbol}")]
+        
+        # Format individual scores
+        lines = [f"📈 ANALYST SCORES for {symbol}\n"]
+        sorted_scores = sorted(orchestrator_result.agent_scores, key=lambda s: s.score, reverse=True)
+        
+        for s in sorted_scores:
+            lines.append(f"{s.agent:<15} {s.decision:<5} Score: {s.score:.1f}/5 (confidence: {s.confidence:.0%})")
+            lines.append(f"  {s.reasoning}\n")
+        
+        return [types.TextContent(type="text", text="\n".join(lines))]
+
+    elif name == "get_orchestrator_consensus":
+        symbol = arguments["symbol"].upper()
+        
+        result = await asyncio.to_thread(run_analysis_with_analysts, [symbol])
+        orchestrator_result = result.get("orchestrator_result")
+        
+        if not orchestrator_result:
+            return [types.TextContent(type="text", text=f"Could not analyze {symbol}")]
+        
+        summary = result.get("orchestrator_summary", "")
+        return [types.TextContent(type="text", text=summary)]
+
+    elif name == "get_evaluator_decision":
+        symbol = arguments["symbol"].upper()
+        current_price = arguments.get("current_price", 150.0)
+        
+        result = await asyncio.to_thread(run_analysis_with_analysts, [symbol])
+        orchestrator_result = result.get("orchestrator_result")
+        
+        if not orchestrator_result:
+            return [types.TextContent(type="text", text=f"Could not analyze {symbol}")]
+        
+        evaluator_decision = evaluate_consensus(
+            orchestrator_result,
+            current_price=current_price,
+            portfolio_context={"vix": 15}
+        )
+        
+        summary = format_evaluator_decision(evaluator_decision)
+        return [types.TextContent(type="text", text=summary)]
+
     else:
         return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
 
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 async def _main():
     async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
