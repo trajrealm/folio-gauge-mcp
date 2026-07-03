@@ -20,6 +20,7 @@ from src.tools.technical import get_technical_snapshot
 
 from .. import config
 from src.utils.logger import get_logger
+import traceback
 
 logger = get_logger(__name__)
 
@@ -119,6 +120,7 @@ Return ONLY a JSON object with this exact structure, no preamble:
             )
 
     except Exception as e:
+        traceback.print_exc()
         logger.error(f"Technical outer exception: {type(e).__name__}: {str(e)}")
         data_gaps.append(f"Technical analysis error: {str(e)}")
         return AgentScore(

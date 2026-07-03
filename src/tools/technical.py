@@ -56,12 +56,17 @@ class TechnicalSnapshot(BaseModel):
 
 
 def _sma(close: pd.Series, window: int) -> float | None:
-    """Simple Moving Average — arithmetic mean of last `window` closes."""
-    if len(close) < window:
+    """Simple Moving Average — arithmetic mean of last `window` closes.
+    Falls back to whatever history is available if fewer than `window` points exist."""
+    if len(close) == 0:
         return None
-    val = close.rolling(window).mean().iloc[-1]
+    effective_window = min(window, len(close))
+    val = close.rolling(effective_window, min_periods=1).mean().iloc[-1]
     return None if pd.isna(val) else round(float(val), 4)
 
+def _sma_points_used(close: pd.Series, window: int) -> int:
+    """How many data points actually went into the SMA (for transparency)."""
+    return min(window, len(close))
 
 def _rsi(close: pd.Series, window: int = config.RSI_WINDOW) -> float | None:
     """

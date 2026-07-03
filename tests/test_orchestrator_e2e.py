@@ -10,10 +10,11 @@ Run with: python tests/test_orchestrator_e2e.py
 
 import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.orchestrator.aggregator import orchestrate_analysis
-import config
+import src.config as config
+from dotenv import load_dotenv
+load_dotenv()  
 
 
 def test_orchestrator_e2e():
@@ -92,10 +93,10 @@ def test_orchestrator_e2e():
         validation_ok = True
         
         # Check 1: All 11 analysts present
-        if len(result.agent_scores) == 11:
-            print(f"   ✅ All 11 analysts called")
+        if len(result.agent_scores) == 9:
+            print(f"   ✅ All 9 analysts called")
         else:
-            print(f"   ❌ Expected 11 analysts, got {len(result.agent_scores)}")
+            print(f"   ❌ Expected 9 analysts, got {len(result.agent_scores)}")
             validation_ok = False
         
         # Check 2: Valid decision

@@ -19,6 +19,8 @@ from src.tools.market import get_portfolio_snapshots
 
 from .. import config
 from src.utils.logger import get_logger
+import traceback
+import sys
 
 logger = get_logger(__name__)
 
@@ -70,7 +72,6 @@ def analyze_portfolio(holdings: list[dict]) -> AgentScore:
             f"- {h['symbol']}: {h.get('weight', 'N/A')}"
             for h in holdings[:10]
         ])
-        
         portfolio_context = f"""
 Number of Holdings: {len(holdings)}
 Top Holdings:
@@ -79,7 +80,7 @@ Top Holdings:
 Portfolio Diversification:
 Total Tickers: {len(holdings)}
 Number with Data: {len(snapshots)}
-Average Price: ${sum(s.price for s in snapshots)/len(snapshots) if snapshots else 0:.2f}
+Average Price: ${sum(s.price.current_price for s in snapshots)/len(snapshots) if snapshots else 0:.2f}
 """
         
         # Call LLM with system message containing skill + prompt
@@ -141,6 +142,7 @@ Return ONLY a JSON object with this exact structure, no preamble:
             )
 
     except Exception as e:
+        traceback.print_exc()
         logger.error(f"Portfolio analysis error: {str(e)}")
         data_gaps.append(f"Portfolio analysis error: {str(e)}")
         return AgentScore(
