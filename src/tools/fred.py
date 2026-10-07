@@ -1,242 +1,98 @@
 """
 tools/fred.py
 -------------
-Federal Reserve Economic Data (FRED) API client.
+Macro snapshot from FRED (Federal Reserve Economic Data).
+Requires FRED_API_KEY. One request per series (config.FRED_SERIES), cached
+for the day: the values are the same for every ticker and change daily at most.
 
-Base URL: https://api.stlouisfed.org/fred
-Requires: FRED_API_KEY environment variable
-Free tier: No rate limits per se, but be respectful (~5 req/sec safe)
-
-Key series IDs:
-  - DFF: Effective Federal Funds Rate (daily)
-  - T10Y2Y: 10-Year minus 2-Year Treasury Spread (daily)
-  - CPIAUCSL: Consumer Price Index (monthly)
-  - UNRATE: Unemployment Rate (monthly)
-  - GDPC1: Real Gross Domestic Product (quarterly)
-  - VIX: CBOE Volatility Index (daily)
+Computed (percent / percentage points):
+  - fed funds rate now and 6 months ago
+  - CPI year-over-year inflation now and 6 months ago
+  - unemployment rate and the Sahm indicator (3-month average unemployment
+    minus its low over the prior 12 months; >= 0.5 has signalled recessions)
+  - real GDP growth, latest quarter, annualized
+  - 10Y-2Y yield curve and VIX, latest
 """
 
 from __future__ import annotations
 
 import os
-import time
-from typing import Optional, Literal
+from datetime import date, timedelta
+from functools import lru_cache
 
-import httpx
 from pydantic import BaseModel
-from tenacity import retry, stop_after_attempt, wait_exponential
+
 from .. import config
-from ..utils.logger import get_logger
-
-logger = get_logger(__name__)
+from ..utils.http import get_json
 
 
-class FredObservation(BaseModel):
-    """A single data point from FRED."""
-
-    date: str  # YYYY-MM-DD
-    value: float | None
-
-
-class FredSeries(BaseModel):
-    """FRED economic series data."""
-
-    series_id: str  # e.g. "DFF"
-    title: str  # Human-readable name
-    units: str | None  # e.g. "Percent", "Index"
-    frequency: str | None  # e.g. "Daily", "Monthly", "Quarterly"
-    observations: list[FredObservation]  # Time series data
+class MacroSnapshot(BaseModel):
+    fed_funds: float
+    fed_funds_6m_ago: float
+    cpi_yoy: float
+    cpi_yoy_6m_ago: float
+    cpi_as_of: str  # CPI is published with a ~1 month lag
+    unemployment: float
+    sahm: float
+    gdp_growth: float
+    gdp_as_of: str  # quarter start date; published with a ~1 quarter lag
+    yield_curve: float
+    vix: float
 
 
-class EconomicIndicators(BaseModel):
-    """Snapshot of key macro indicators."""
-
-    fed_funds_rate: float | None  # Latest DFF (%)
-    unemployment_rate: float | None  # Latest UNRATE (%)
-    cpi_yoy_change: float | None  # YoY CPI change (%)
-    yield_spread_10y2y: float | None  # 10Y - 2Y Treasury (%)
-    gdp_growth_rate: float | None  # Latest GDPC1 growth (% annualized)
-    vix_index: float | None  # CBOE VIX (index)
-    fetched_at: str  # ISO 8601 timestamp when fetched
-
-
-class FredClient:
-    """FRED API client."""
-
-    def __init__(self, api_key: Optional[str] = None):
-        """
-        Initialize FRED client.
-        """
-        self.api_key = api_key or os.getenv("FRED_API_KEY")
-        if not self.api_key:
-            raise ValueError(
-                "FRED_API_KEY not provided and FRED_API_KEY environment variable not set."
-            )
-
-    @retry(
-        stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10)
+def _series(series_id: str) -> list[tuple[str, float]]:
+    """(date, value) pairs, oldest first; missing values ('.') dropped."""
+    start = date.today() - timedelta(days=config.FRED_HISTORY_DAYS)
+    data = get_json(
+        f"{config.FRED_BASE_URL}/series/observations",
+        params={
+            "series_id": series_id,
+            "api_key": os.environ["FRED_API_KEY"],
+            "file_type": "json",
+            "observation_start": start.isoformat(),
+        },
     )
-    def _get(self, endpoint: str, params: dict) -> dict:
-        """
-        GET request with retry logic.
-        """
-        time.sleep(0.2)  # Rate limiting
+    return [(o["date"], float(o["value"])) for o in data["observations"] if o["value"] != "."]
 
-        url = f"{config.FRED_BASE_URL}/{endpoint}"
-        params["api_key"] = self.api_key
-        params["file_type"] = "json"
 
-        response = httpx.get(url, params=params, timeout=15)
-        response.raise_for_status()
+def _on_or_before(series: list[tuple[str, float]], day: date) -> float:
+    return [v for d, v in series if d <= day.isoformat()][-1]
 
-        return response.json()
 
-    def get_series(
-        self,
-        series_id: str,
-        limit: int = config.FRED_DEFAULT_SERIES_LIMIT,
-        sort_order: Literal["asc", "desc"] = "desc",
-    ) -> FredSeries:
-        """
-        Fetch a FRED series.
-        """
-        series_info = self._get("series", {"series_id": series_id})
-        series_meta = series_info.get("seriess", [{}])[0]
+def _months_before(day: str, months: int) -> date:
+    d = date.fromisoformat(day)
+    y, m = divmod(d.year * 12 + d.month - 1 - months, 12)
+    return date(y, m + 1, 1)
 
-        obs_response = self._get(
-            "series/observations",
-            {
-                "series_id": series_id,
-                "limit": min(limit, 100000),
-                "sort_order": sort_order,
-            },
-        )
 
-        observations = [
-            FredObservation(
-                date=o["date"], value=float(o["value"]) if o["value"] != "." else None
-            )
-            for o in obs_response.get("observations", [])
-        ]
+@lru_cache(maxsize=1)
+def _snapshot(day: str) -> MacroSnapshot:
+    s = {name: _series(series_id) for name, series_id in config.FRED_SERIES.items()}
+    fed, cpi, unemp, gdp = s["fed_funds"], s["cpi"], s["unemployment"], s["gdp"]
 
-        return FredSeries(
-            series_id=series_id,
-            title=series_meta.get("title", ""),
-            units=series_meta.get("units", ""),
-            frequency=series_meta.get("frequency", ""),
-            observations=observations,
-        )
+    # Look up by calendar month, not row offset: months can be missing
+    # (October 2025 was not collected during the government shutdown).
+    def yoy(months_back: int) -> float:
+        end = _months_before(cpi[-1][0], months_back)
+        return (_on_or_before(cpi, end) / _on_or_before(cpi, _months_before(end.isoformat(), 12)) - 1) * 100
 
-    def get_latest_value(self, series_id: str) -> float | None:
-        """
-        Get the latest value for a series.
-        """
-        series = self.get_series(series_id, limit=1)
-        if series.observations and series.observations[0].value is not None:
-            return series.observations[0].value
-        return None
+    ma3 = [sum(v for _, v in unemp[i - 3 : i]) / 3 for i in range(3, len(unemp) + 1)]
 
-    def get_multiple_series(
-        self, series_ids: list[str], limit: int = config.FRED_DEFAULT_MULTISERIES_LIMIT
-    ) -> dict[str, FredSeries]:
-        """
-        Fetch multiple series in parallel (sequential for simplicity).
-
-        """
-        result = {}
-        for series_id in series_ids:
-            try:
-                result[series_id] = self.get_series(series_id, limit=limit)
-            except Exception as e:
-                logger.error(f"Failed to fetch {series_id}: {e}")
-        return result
-
-def get_economic_indicators(api_key: Optional[str] = None) -> EconomicIndicators:
-    from datetime import datetime, timezone
-
-    client = FredClient(api_key)
-
-    fed_funds = client.get_latest_value("DFF")
-    unemployment = client.get_latest_value("UNRATE")
-    yield_spread = client.get_latest_value("T10Y2Y")
-    vix = client.get_latest_value("VIXCLS")
-
-    # CPI: fetch last 13 months to compute YoY % change
-    cpi_series = client.get_series("CPIAUCSL", limit=config.FRED_CPI_LOOKBACK_MONTHS, sort_order="desc")
-    cpi_yoy = None
-    if len(cpi_series.observations) >= config.FRED_CPI_LOOKBACK_MONTHS:
-        latest_cpi = cpi_series.observations[0].value
-        year_ago_cpi = cpi_series.observations[12].value
-        if latest_cpi and year_ago_cpi and year_ago_cpi != 0:
-            cpi_yoy = round(((latest_cpi - year_ago_cpi) / year_ago_cpi) * 100, 2)
-
-    # GDP: fetch last 2 quarters to compute QoQ annualized growth
-    gdp_series = client.get_series("GDPC1", limit=config.FRED_GDP_LOOKBACK_QUARTERS, sort_order="desc")
-    gdp_growth = None
-    if len(gdp_series.observations) >= config.FRED_GDP_LOOKBACK_QUARTERS:
-        latest_gdp = gdp_series.observations[0].value
-        prior_gdp = gdp_series.observations[1].value
-        if latest_gdp and prior_gdp and prior_gdp != 0:
-            # Annualize the quarterly growth rate
-            gdp_growth = round(((latest_gdp / prior_gdp) ** 4 - 1) * 100, 2)
-
-    return EconomicIndicators(
-        fed_funds_rate=fed_funds,
-        unemployment_rate=unemployment,
-        cpi_yoy_change=cpi_yoy,
-        yield_spread_10y2y=yield_spread,
-        gdp_growth_rate=gdp_growth,
-        vix_index=vix,
-        fetched_at=datetime.now(timezone.utc).isoformat(),
+    return MacroSnapshot(
+        fed_funds=fed[-1][1],
+        fed_funds_6m_ago=_on_or_before(fed, date.fromisoformat(day) - timedelta(days=182)),
+        cpi_yoy=yoy(0),
+        cpi_yoy_6m_ago=yoy(6),
+        cpi_as_of=cpi[-1][0],
+        unemployment=unemp[-1][1],
+        sahm=ma3[-1] - min(ma3[-13:-1]),
+        gdp_growth=((gdp[-1][1] / gdp[-2][1]) ** 4 - 1) * 100,
+        gdp_as_of=gdp[-1][0],
+        yield_curve=s["yield_curve"][-1][1],
+        vix=s["vix"][-1][1],
     )
 
 
-def get_interest_rate_environment(api_key: Optional[str] = None) -> dict:
-    """
-    Fetch interest rate data for macro analysis.
-
-    Returns dict with:
-      - fed_funds_rate (current)
-      - 10y2y_spread (rate curve)
-      - cpi (inflation proxy)
-    """
-    client = FredClient(api_key)
-
-    return {
-        "fed_funds_rate": client.get_latest_value("DFF"),
-        "10y2y_spread": client.get_latest_value("T10Y2Y"),
-        "cpi": client.get_latest_value("CPIAUCSL"),
-    }
-
-
-def get_unemployment_data(
-    api_key: Optional[str] = None, months: int = 12
-) -> list[FredObservation]:
-    """
-    Fetch unemployment rate history.
-    """
-    client = FredClient(api_key)
-    series = client.get_series("UNRATE", limit=months + 5)
-    return series.observations
-
-
-def get_gdp_data(
-    api_key: Optional[str] = None, quarters: int = 20
-) -> list[FredObservation]:
-    """
-    Fetch GDP (real, quarterly) history.
-    """
-    client = FredClient(api_key)
-    series = client.get_series("GDPC1", limit=quarters + 5)
-    return series.observations
-
-
-def get_vix_data(
-    api_key: Optional[str] = None, days: int = 60
-) -> list[FredObservation]:
-    """
-    Fetch VIX (volatility index) history.
-    """
-    client = FredClient(api_key)
-    series = client.get_series("VIXCLS", limit=days + 10)
-    return series.observations
+def get_macro_snapshot() -> MacroSnapshot:
+    """Today's macro snapshot (cached for the day)."""
+    return _snapshot(date.today().isoformat())

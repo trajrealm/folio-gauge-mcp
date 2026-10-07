@@ -2,131 +2,117 @@
 src/analysts/macro.py
 Macro Analyst Agent
 
-Evaluates macroeconomic conditions and policy impact on equities.
-Uses LLM with domain knowledge from skills/macro.md and prompts/macro.md to guide analysis.
-Returns AgentScore with macro outlook.
+The macro regime (rates, inflation, labor, growth, yield curve, volatility)
+is labelled in code from the FRED snapshot and given to the LLM as facts,
+with the stock's sector. The LLM judges how this backdrop affects that
+sector and scores. Errors propagate to the caller.
 """
 
 from __future__ import annotations
 
-import os
-
-import json
+import yfinance as yf
 from langchain_openai import ChatOpenAI
-from src.agent.scoring import AgentScore
-from src.agent.knowledge import get_system_message
-from src.tools.fred import get_economic_indicators
+from pydantic import BaseModel, Field
+
+from src.agent.knowledge import load_prompt
+from src.agent.scoring import AgentScore, compute_confidence, decision_from_score
+from src.tools.fred import MacroSnapshot, get_macro_snapshot
 
 from .. import config
-from src.utils.logger import get_logger
 
-logger = get_logger(__name__)
+# Signal for equities per label: rates, inflation, labor and growth drive
+# confidence; curve and volatility are context only.
+SIGNALS = {
+    "easing": 1, "tightening": -1,
+    "cooling": 1, "heating": -1,
+    "solid": 1, "softening": 0, "recession signal": -1,
+    "expanding": 1, "slow": 0, "contracting": -1,
+    "stable": 0,
+}  # fmt: skip
 
 
-def _get_llm() -> ChatOpenAI:
-    return ChatOpenAI(model=config.LLM_MODEL_AGENTS, temperature=config.LLM_TEMPERATURE_AGENTS)
+class MacroAnalysis(BaseModel):
+    score: int = Field(ge=1, le=5, description="1=strong headwind for this sector, 3=neutral, 5=strong tailwind")
+    reasoning: str = Field(description="2-3 sentence explanation")
+    key_signals: list[str]
+    risk_flags: list[str]
+
+
+def _change(delta: float, band: float, up: str, down: str) -> str:
+    return up if delta > band else down if delta < -band else "stable"
+
+
+def _labels(m: MacroSnapshot) -> dict[str, str]:
+    softening, recession = config.MACRO_SAHM_BANDS
+    expanding, contracting = config.MACRO_GDP_BANDS
+    normal, inverted = config.MACRO_CURVE_BANDS
+    calm, stressed = config.MACRO_VIX_BANDS
+    return {
+        "rates": _change(m.fed_funds - m.fed_funds_6m_ago, config.MACRO_RATE_CHANGE_BAND, "tightening", "easing"),
+        "inflation": _change(m.cpi_yoy - m.cpi_yoy_6m_ago, config.MACRO_INFLATION_CHANGE_BAND, "heating", "cooling"),
+        "labor": "recession signal" if m.sahm >= recession else "softening" if m.sahm >= softening else "solid",
+        "growth": "expanding" if m.gdp_growth > expanding else "contracting" if m.gdp_growth < contracting else "slow",
+        "yield curve": "normal" if m.yield_curve > normal else "inverted" if m.yield_curve < inverted else "flat",
+        "volatility": "calm" if m.vix < calm else "stressed" if m.vix > stressed else "normal",
+    }
+
+
+def _format_snapshot(m: MacroSnapshot) -> str:
+    return "\n".join(
+        [
+            f"  Fed funds rate: {m.fed_funds:.2f}% (6 months ago: {m.fed_funds_6m_ago:.2f}%)",
+            f"  CPI inflation YoY: {m.cpi_yoy:.2f}% (6 months earlier: {m.cpi_yoy_6m_ago:.2f}%), as of {m.cpi_as_of}",
+            f"  Unemployment: {m.unemployment:.1f}%; Sahm indicator: {m.sahm:.2f} (>= 0.5 has signalled recessions)",
+            f"  Real GDP growth (annualized): {m.gdp_growth:.1f}%, quarter starting {m.gdp_as_of}",
+            f"  Yield curve 10Y-2Y: {m.yield_curve:+.2f} pts",
+            f"  VIX: {m.vix:.1f}",
+        ]
+    )
 
 
 def analyze_macro(ticker: str) -> AgentScore:
     """
-    Analyze macro indicators using LLM guided by domain knowledge.
+    Flow:
+      1. Fetch the FRED macro snapshot (cached per day) and the stock's sector
+      2. Compute regime labels in code
+      3. LLM judges the impact on this sector and scores; decision is derived from the score
+      4. Confidence = agreement of rates, inflation, labor and growth labels
     """
-    
-    data_gaps: list[str] = []
-    
-    try:
-        # Fetch macro indicators
-        indicators = get_economic_indicators()
-        
-        if not indicators:
-            data_gaps.append("No macro data available from FRED")
-            return AgentScore(
-                agent="macro",
-                symbol=ticker,
-                decision="HOLD",
-                score=2,
-                timeframe="mid",
-                reasoning="Insufficient macro data",
-                confidence=0.3,
-                data_gaps=data_gaps,
-            )
-        
-        # Format macro data for LLM
-        macro_context = f"""
-Federal Reserve Rate: {indicators.fed_funds_rate:.2f}% (neutral ~3.5%)
-CPI YoY Change: {indicators.cpi_yoy_change:.2f}%
-Unemployment Rate: {indicators.unemployment_rate:.2f}%
-Yield Curve (10Y-2Y): {indicators.yield_spread_10y2y:.2f}%
-VIX Index: {indicators.vix_index:.1f}
-"""
-        
-        # Call LLM with system message containing skill + prompt
-        system_prompt = get_system_message("macro", include_skill=True)
-        
-        user_message = f"""Analyze macro conditions for equity analysis of {ticker}:
+    snapshot = get_macro_snapshot()
+    sector = yf.Ticker(ticker).info.get("sector")
+    labels = _labels(snapshot)
+    labels_text = "; ".join(f"{k}: {v}" for k, v in labels.items())
 
-{macro_context}
+    user_prompt = f"""Assess the macro backdrop for {ticker} (sector: {sector or "unknown"}).
 
-Based on these macro indicators and your domain knowledge, assess the macro environment outlook.
+{_format_snapshot(snapshot)}
 
-Return ONLY a JSON object with this exact structure, no preamble:
-{{
-  "score": <1-5, where 1=very bearish, 3=neutral, 5=very bullish>,
-  "decision": "<BUY|HOLD|SELL>",
-  "confidence": <0.0-1.0>,
-  "reasoning": "<2-3 sentence explanation>",
-  "key_signals": ["<signal1>", "<signal2>"]
-}}"""
-        
-        try:
-            llm = _get_llm()
-            response = llm.invoke([
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ], config={"run_name": "Macro Agent"})
+Computed assessment (facts): {labels_text}"""
 
-            result = json.loads(response.content)
+    llm = ChatOpenAI(model=config.LLM_MODEL_AGENTS, temperature=config.LLM_TEMPERATURE_AGENTS)
+    analysis: MacroAnalysis = llm.with_structured_output(MacroAnalysis).invoke(
+        [
+            {"role": "system", "content": load_prompt("macro")},
+            {"role": "user", "content": user_prompt},
+        ],
+        config={"run_name": "Macro Agent"},
+    )
 
-            score = max(1.0, min(5.0, float(result.get("score", 3.0))))
-            decision = result.get("decision", "HOLD").upper()
-            confidence = max(0.0, min(1.0, float(result.get("confidence", 0.5))))
-            reasoning = result.get("reasoning", "")
+    signals = [SIGNALS[labels[k]] for k in ("rates", "inflation", "labor", "growth")]
 
-            return AgentScore(
-                agent="macro",
-                symbol=ticker,
-                decision=decision,
-                score=int(round(score)),
-                timeframe="mid",
-                reasoning=reasoning,
-                confidence=confidence,
-                data_gaps=data_gaps,
-            )
+    parts = [analysis.reasoning, labels_text[0].upper() + labels_text[1:] + "."]
+    if analysis.key_signals:
+        parts.append("Key signals: " + ", ".join(analysis.key_signals) + ".")
+    if analysis.risk_flags:
+        parts.append("Risks: " + ", ".join(analysis.risk_flags) + ".")
 
-        except json.JSONDecodeError:
-            logger.error(f"Macro JSON decode error: {response.content}")
-            data_gaps.append("LLM response was not valid JSON")
-            return AgentScore(
-                agent="macro",
-                symbol=ticker,
-                decision="HOLD",
-                score=2,
-                timeframe="mid",
-                reasoning="LLM analysis failed - invalid response format",
-                confidence=0.2,
-                data_gaps=data_gaps,
-            )
-
-    except Exception as e:
-        logger.error(f"Macro analysis error: {str(e)}")
-        data_gaps.append(f"Macro analysis error: {str(e)}")
-        return AgentScore(
-            agent="macro",
-            symbol=ticker,
-            decision="HOLD",
-            score=2,
-            timeframe="mid",
-            reasoning=f"Macro analysis failed: {str(e)}",
-            confidence=0.2,
-            data_gaps=data_gaps,
-        )
+    return AgentScore(
+        agent="macro",
+        symbol=ticker,
+        decision=decision_from_score(analysis.score),
+        score=analysis.score,
+        timeframe="mid",
+        reasoning="Macro: " + " ".join(parts),
+        confidence=compute_confidence(1.0 if sector else 0.5, signals),
+        data_gaps=[] if sector else ["Sector unknown; macro judged market-wide"],
+    )

@@ -72,12 +72,25 @@ EDGAR_EMBEDDING_MODEL: str = "text-embedding-3-small"
 EDGAR_EMBEDDING_DIMENSION: int = 1536
 EDGAR_BATCH_SIZE: int = 100
 
-# FRED
-FRED_BASE_URL: str ="https://api.stlouisfed.org/fred"
-FRED_DEFAULT_SERIES_LIMIT: int = 250
-FRED_DEFAULT_MULTISERIES_LIMIT: int = 100
-FRED_CPI_LOOKBACK_MONTHS: int = 13
-FRED_GDP_LOOKBACK_QUARTERS: int = 2
+# FRED (macro). Each series is fetched once per day; 2 years of history.
+FRED_BASE_URL: str = "https://api.stlouisfed.org/fred"
+FRED_HISTORY_DAYS: int = 730
+FRED_SERIES: dict[str, str] = {
+    "fed_funds": "DFF",  # effective fed funds rate, daily, %
+    "cpi": "CPIAUCSL",  # CPI index, monthly
+    "unemployment": "UNRATE",  # %, monthly
+    "gdp": "GDPC1",  # real GDP, quarterly
+    "yield_curve": "T10Y2Y",  # 10Y - 2Y treasury, daily, %
+    "vix": "VIXCLS",  # daily
+}
+
+# Macro labels (percentage points unless noted)
+MACRO_RATE_CHANGE_BAND: float = 0.25  # fed funds change over 6 months -> easing / tightening
+MACRO_INFLATION_CHANGE_BAND: float = 0.3  # CPI YoY change over 6 months -> cooling / heating
+MACRO_SAHM_BANDS: tuple[float, float] = (0.3, 0.5)  # softening / recession signal
+MACRO_GDP_BANDS: tuple[float, float] = (2.0, 0.0)  # expanding above / contracting below (annualized %)
+MACRO_CURVE_BANDS: tuple[float, float] = (0.5, 0.0)  # normal above / inverted below
+MACRO_VIX_BANDS: tuple[float, float] = (15, 25)  # calm below / stressed above
 
 # Attention: Reddit mentions via ApeWisdom (no key), StockTwits trending
 REDDIT_FILTER: str = "all-stocks"

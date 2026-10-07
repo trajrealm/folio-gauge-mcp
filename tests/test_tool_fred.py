@@ -1,15 +1,30 @@
-# test_fred_tool.py
+"""
+test_tool_fred.py
+-----------------
+Smoke-tests src/tools/fred.py (macro snapshot). Requires FRED_API_KEY in .env.
+Run from project root:
+    uv run python -m tests.test_tool_fred
+"""
+
 from dotenv import load_dotenv
+
 load_dotenv()
 
-from src.tools.fred import get_economic_indicators
+from src.tools.fred import get_macro_snapshot  # noqa: E402
 
-indicators = get_economic_indicators()
+print("\n== fred.py tool ==\n")
 
-print(f"Fed Funds Rate:     {indicators.fed_funds_rate}%")
-print(f"Unemployment Rate:  {indicators.unemployment_rate}%")
-print(f"CPI YoY Change:     {indicators.cpi_yoy_change}%")
-print(f"Yield Spread 10Y2Y: {indicators.yield_spread_10y2y}%")
-print(f"GDP Growth Rate:    {indicators.gdp_growth_rate}%")
-print(f"VIX Index:          {indicators.vix_index}")
-print(f"Fetched At:         {indicators.fetched_at}")
+snapshot = get_macro_snapshot()
+for field, value in snapshot.model_dump().items():
+    print(f"  {field:<18} {value}")
+print()
+
+checks = {
+    "Fed funds in 0-20%": 0 <= snapshot.fed_funds <= 20,
+    "CPI YoY in -5..20%": -5 <= snapshot.cpi_yoy <= 20,
+    "Unemployment in 0-25%": 0 < snapshot.unemployment < 25,
+    "Cached on second call": get_macro_snapshot() is snapshot,
+}
+for label, ok in checks.items():
+    print(f"  [{'PASS' if ok else 'FAIL'}] {label}")
+print()
