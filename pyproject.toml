@@ -30,5 +30,7 @@ dev = [
     "ruff>=0.15.12",
 ]
 
-[project.scripts]
-folio-gauge = "src.mcp.server:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests/test_config.py", "tests/test_aggregator.py", "tests/test_evaluator.py"]
