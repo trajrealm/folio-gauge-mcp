@@ -2,7 +2,7 @@
 agent/graph.py
 --------------
 Wires all nodes into a LangGraph StateGraph.
-The orchestrator calls all 9 core specialist analysts and aggregates their scores.
+The orchestrator calls all 8 core specialist analysts and aggregates their scores.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ logger = get_logger(__name__)
 def build_analyst_graph() -> StateGraph:
     """
     Build analyst pipeline: calls 9 analysts -> orchestrator -> evaluator.
-    Each ticker is analyzed by all 9 core agents, scores are aggregated.
+    Each ticker is analyzed by all 8 core agents, scores are aggregated.
     """
     graph = StateGraph(AgentState)
 

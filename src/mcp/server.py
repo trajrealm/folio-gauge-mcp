@@ -47,8 +47,8 @@ async def list_tools() -> list[types.Tool]:
             name="analyze_ticker",
             description=(
                 "Analyze a single stock ticker using the 11-agent orchestrator system. "
-                "Combines 9 core analysts (technical, fundamentals, sentiment, macro, peers, trends, "
-                "earnings, news, price_volume) plus orchestrator and evaluator consolidation layers."
+                "Combines 8 core analysts (technical, fundamentals, sentiment, macro, peers, trends, "
+                "earnings, news) plus orchestrator and evaluator consolidation layers."
             ),
             inputSchema={
                 "type": "object",
@@ -116,8 +116,8 @@ async def list_tools() -> list[types.Tool]:
             name="get_analyst_scores",
             description=(
                 "Get individual analyst scores for a ticker. "
-                "Returns scores from 9 core analysts: technical, fundamentals, sentiment, macro, "
-                "peers, trends, earnings, news, and price_volume."
+                "Returns scores from 8 core analysts: technical, fundamentals, sentiment, macro, "
+                "peers, trends, earnings, and news."
             ),
             inputSchema={
                 "type": "object",

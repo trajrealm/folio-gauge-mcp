@@ -20,8 +20,8 @@ VALID_TIMEFRAMES: tuple[str, ...] = ("short", "mid", "long")
 # ---------------------------------------------------------------------------
 # Agent weights for orchestrator aggregation
 # Must sum to 1.0
-# Covers 9 core analysts: technical, fundamentals, sentiment, macro, peers,
-# trends, earnings, news, price_volume
+# Covers 8 core analysts: technical, fundamentals, sentiment, macro, peers,
+# trends, earnings, news
 # ---------------------------------------------------------------------------
 
 AGENT_WEIGHTS: dict[str, float] = {
@@ -33,7 +33,6 @@ AGENT_WEIGHTS: dict[str, float] = {
     "trends":       0.09,
     "earnings":     0.08,
     "news":         0.08,
-    "price_volume": 0.08,
     "discovery":    0.08,
     "portfolio":    0.14,
 }
@@ -83,11 +82,20 @@ FRED_GDP_LOOKBACK_QUARTERS: int = 2
 # Trends
 REDDIT_FILTER: str = "all-stocks"
 
-# Technical Analysis
+# Technical Analysis (price and volume)
+TECHNICAL_HISTORY_PERIOD: str = "2y"
 RSI_WINDOW: int = 14
 MACD_FAST_EMA_PERIOD: int = 12
 MACD_SLOW_EMA_PERIOD: int = 26
 MACD_SIGNAL_PERIOD: int = 9
+# Trading days per lookback
+TECHNICAL_RETURN_WINDOWS: dict[str, int] = {"return_1m": 21, "return_3m": 63, "return_6m": 126}
+TECHNICAL_VOLUME_WINDOW: int = 20  # volume balance and recent average volume
+TECHNICAL_VOLUME_BASELINE: int = 63  # baseline average volume (3 months)
+# Labels
+TECHNICAL_RETURN_BANDS: dict[str, float] = {"return_1m": 0.02, "return_3m": 0.05, "return_6m": 0.10}
+TECHNICAL_VOLUME_BALANCE_BAND: float = 0.10  # (up - down volume) / total beyond +/-10%
+TECHNICAL_RSI_BANDS: tuple[float, float] = (70, 30)  # overbought / oversold
 
 # News Analysis
 NEWS_MAX_SUMMARY_CHARS: int = 500

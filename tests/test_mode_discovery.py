@@ -3,7 +3,7 @@ tests/test_mode_discovery.py
 Test Discovery Mode (Two-Phase)
 
 Phase 1: Discovery agent identifies trending candidates from social sentiment
-Phase 2: 9 core analysts evaluate shortlist
+Phase 2: 8 core analysts evaluate shortlist
 Run with: python tests/test_mode_discovery.py
 """
 
@@ -79,7 +79,7 @@ def test_discovery_mode():
     print("📍 PHASE 2: PARALLEL ANALYSIS ON SHORTLIST")
     print("-" * 70 + "\n")
     
-    print("Calling 9 core analysts on each shortlisted ticker...\n")
+    print("Calling 8 core analysts on each shortlisted ticker...\n")
     
     discovery_recommendations = []
     

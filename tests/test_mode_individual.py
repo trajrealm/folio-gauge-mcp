@@ -2,7 +2,7 @@
 tests/test_mode_individual.py
 Test Individual (Ticker) Mode
 
-Tests single-stock analysis with 9 core analysts.
+Tests single-stock analysis with 8 core analysts.
 Run with: python tests/test_mode_individual.py
 """
 

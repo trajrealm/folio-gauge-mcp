@@ -2,14 +2,14 @@
 src/orchestrator/aggregator.py
 Orchestrator Agent
 
-Calls all 11 specialist analysts, aggregates their scores into consensus,
+Calls all 10 specialist analysts, aggregates their scores into consensus,
 and identifies conflicts/divergence.
 Uses domain knowledge from skills/orchestrator.md to guide aggregation logic.
 Returns OrchestratorResult with final weighted recommendation.
 
-The 11 analysts:
-  Core 9 analysts:
-    1. technical      — technical indicators (SMA, RSI, MACD)
+The 10 analysts:
+  Core 8 analysts:
+    1. technical      — price trend, momentum and volume
     2. fundamentals   — P/E, P/B, margins, debt
     3. sentiment      — Polymarket odds, StockTwits, news
     4. macro          — economic indicators (FRED)
@@ -17,10 +17,9 @@ The 11 analysts:
     6. trends         — Reddit mentions, StockTwits trending
     7. earnings       — EPS growth, guidance, beats/misses
     8. news           — article sentiment analysis
-    9. price_volume   — 52-week range, volume, dividend
   Portfolio agents:
-    10. discovery     — candidate discovery and shortlisting
-    11. portfolio     — portfolio-level analysis and rebalancing
+    9. discovery      — candidate discovery and shortlisting
+    10. portfolio     — portfolio-level analysis and rebalancing
 """
 
 from __future__ import annotations
@@ -40,7 +39,6 @@ from src.analysts import (
     analyze_trends,
     analyze_earnings,
     analyze_news,
-    analyze_price_volume,
     analyze_portfolio,
 )
 
@@ -71,7 +69,6 @@ def orchestrate_analysis(
         ("trends", analyze_trends),
         ("earnings", analyze_earnings),
         ("news", analyze_news),
-        ("price_volume", analyze_price_volume),
     ]
 
     for analyst_name, analyst_func in analysts:
