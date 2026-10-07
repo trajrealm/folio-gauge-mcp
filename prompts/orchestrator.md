@@ -148,7 +148,7 @@ score = Σ (analyst_score × analyst_weight)
 **Example Scenarios:**
 - Technical 0.35 (others 0.65): Early momentum break? Valid warning. Keep weight.
 - Discovery 0.90 (others 0.60): Strong screening signal? Worth investigating. Keep weight.
-- Sentiment 0.20 (others 0.65): Extreme bearish Reddit? Contrarian opportunity? Keep weight.
+- Sentiment 0.20 (others 0.65): Extreme bearish social sentiment? Contrarian opportunity? Keep weight.
 
 ## Recommendation Mapping
 

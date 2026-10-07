@@ -1,0 +1,7 @@
+symbol,qty,avg_cost,type
+AAPL,50,178.00,long
+MSFT,20,310.00,long
+NVDA,40,120.00,long
+JPM,30,150.00,long
+LULU,15,400.00,long
+TSLA,10,220.00,short

@@ -92,8 +92,8 @@ MACRO_GDP_BANDS: tuple[float, float] = (2.0, 0.0)  # expanding above / contracti
 MACRO_CURVE_BANDS: tuple[float, float] = (0.5, 0.0)  # normal above / inverted below
 MACRO_VIX_BANDS: tuple[float, float] = (15, 25)  # calm below / stressed above
 
-# Attention: Reddit mentions via ApeWisdom (no key), StockTwits trending
-REDDIT_FILTER: str = "all-stocks"
+# Attention: ApeWisdom mention counts (no key), StockTwits trending
+APEWISDOM_FILTER: str = "all-stocks"
 
 # Return lookbacks in trading days (technical and sector)
 RETURN_WINDOWS: dict[str, int] = {"return_1m": 21, "return_3m": 63, "return_6m": 126}
@@ -182,9 +182,15 @@ POLY_SKIP_PATTERN: str = r"\$\s?\d|up or down|candidate [a-z]\b|will other\b"
 SENTIMENT_MIN_TAGGED: int = 5  # fewer bullish/bearish-tagged StockTwits posts -> not assessable
 SENTIMENT_NET_BAND: float = 0.2  # (bullish - bearish) / tagged beyond +/-0.2
 SENTIMENT_MESSAGES_FOR_LLM: int = 10
-ATTENTION_MIN_MENTIONS: int = 10  # fewer Reddit mentions -> "low" attention
+ATTENTION_MIN_MENTIONS: int = 10  # fewer ApeWisdom mentions -> "low" attention
 ATTENTION_CHANGE_BAND: float = 0.25  # 24h mention change beyond +/-25% -> rising/falling
 
-# Portfolio
-PORTFOLIO_CSV_COLUMNS: tuple[str, ...] = ("symbol", "qty", "avg_cost", "type")
-VALID_POSITION_TYPES: tuple[str, ...] = ("long", "short")
+# Portfolio (CSV columns: symbol, qty, avg_cost, type)
+PORTFOLIO_MAX_WEIGHT: float = 0.20  # a single position above 20% of gross exposure is concentrated
+PORTFOLIO_MAX_SECTOR_WEIGHT: float = 0.40  # a sector above 40% is concentrated
+PORTFOLIO_ADD_MIN_CONFIDENCE: float = 0.6  # BUY needs this confidence to "add"
+PORTFOLIO_EXIT_MIN_CONFIDENCE: float = 0.7  # SELL needs this confidence to "exit" (else "trim")
+
+# Discovery: trending candidates from ApeWisdom and StockTwits
+DISCOVERY_POOL: int = 25  # top ApeWisdom tickers and StockTwits trending symbols considered
+DISCOVERY_LIMIT: int = 5

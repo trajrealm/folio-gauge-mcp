@@ -2,24 +2,20 @@
 src/orchestrator/aggregator.py
 Orchestrator Agent
 
-Calls all 10 specialist analysts, aggregates their scores into consensus,
+Calls the 8 per-ticker analysts, aggregates their scores into consensus,
 and identifies conflicts/divergence.
 Uses domain knowledge from skills/orchestrator.md to guide aggregation logic.
 Returns OrchestratorResult with final weighted recommendation.
 
-The 10 analysts:
-  Core 8 analysts:
+The 8 analysts:
     1. technical      — price trend, momentum and volume
-    2. fundamentals   — P/E, P/B, margins, debt
-    3. sentiment      — Polymarket odds, StockTwits, news
+    2. fundamentals   — valuation, profitability, financial health
+    3. sentiment      — StockTwits, ApeWisdom attention, Polymarket
     4. macro          — economic indicators (FRED)
     5. peers          — relative valuation vs peers
     6. sector         — sector ETF vs market, stock vs sector
-    7. earnings       — EPS growth, guidance, beats/misses
+    7. earnings       — SEC financials, guidance, earnings quality
     8. news           — article sentiment analysis
-  Portfolio agents:
-    9. discovery      — candidate discovery and shortlisting
-    10. portfolio     — portfolio-level analysis and rebalancing
 """
 
 from __future__ import annotations
@@ -39,7 +35,6 @@ from src.analysts import (
     analyze_sector,
     analyze_earnings,
     analyze_news,
-    analyze_portfolio,
 )
 
 from .. import config

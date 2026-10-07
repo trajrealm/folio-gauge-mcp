@@ -1,9 +1,9 @@
 """
 src/tools/apewisdom.py
 ----------------------
-Reddit mention counts via ApeWisdom (no API key). ApeWisdom aggregates
-r/wallstreetbets, r/stocks, r/investing, r/options and others; Reddit's own
-API is not used. Results are ranked by mentions, 100 per page.
+Ticker mention counts from ApeWisdom (apewisdom.io, public API, no key).
+ApeWisdom counts ticker mentions on stock discussion forums over a rolling
+24h window. Results are ranked by mentions, 100 per page.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from ..utils.http import get_json
 _URL = "https://apewisdom.io/api/v1.0/filter/{filter}/page/{page}"
 
 
-class RedditMention(BaseModel):
+class ApeWisdomMention(BaseModel):
     symbol: str
     rank: int
     mentions: int
@@ -26,11 +26,11 @@ class RedditMention(BaseModel):
 
 
 def _page(page: int) -> dict:
-    return get_json(_URL.format(filter=config.REDDIT_FILTER, page=page))
+    return get_json(_URL.format(filter=config.APEWISDOM_FILTER, page=page))
 
 
-def _parse(item: dict) -> RedditMention:
-    return RedditMention(
+def _parse(item: dict) -> ApeWisdomMention:
+    return ApeWisdomMention(
         symbol=item["ticker"].upper(),
         rank=item["rank"],
         mentions=item["mentions"],
@@ -40,7 +40,7 @@ def _parse(item: dict) -> RedditMention:
     )
 
 
-def fetch_reddit_mentions(ticker: str) -> RedditMention | None:
+def fetch_mentions(ticker: str) -> ApeWisdomMention | None:
     """Mentions for one ticker, searching every page. None if it is not ranked."""
     ticker = ticker.upper()
     page, pages = 1, 1
@@ -54,6 +54,6 @@ def fetch_reddit_mentions(ticker: str) -> RedditMention | None:
     return None
 
 
-def fetch_reddit_top(limit: int = 25) -> list[RedditMention]:
+def fetch_top(limit: int = 25) -> list[ApeWisdomMention]:
     """Most-mentioned tickers right now (first page)."""
     return [_parse(item) for item in _page(1)["results"][:limit]]

@@ -5,7 +5,7 @@ Sentiment Analyst Agent (retail sentiment and attention)
 Sources, each optional (a failure is logged with its stack trace and recorded
 as a data gap; the analysis continues with the rest):
   - StockTwits posts: tag counts (code) and text tone (LLM)
-  - Attention: Reddit mentions via ApeWisdom, StockTwits trending
+  - Attention: ApeWisdom mention counts, StockTwits trending
   - Polymarket: non-price prediction markets, as context
 
 Labels from numbers are computed in code and given to the LLM as facts.
@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 from src.agent.knowledge import load_prompt
 from src.agent.scoring import AgentScore, compute_confidence, decision_from_score
 from src.tools.polymarket import PolymarketMarket, fetch_polymarket_markets
-from src.tools.apewisdom import RedditMention, fetch_reddit_mentions
+from src.tools.apewisdom import ApeWisdomMention, fetch_mentions
 from src.tools.stocktwits import StockTwitsSentiment, fetch_stocktwits_sentiment, fetch_stocktwits_trending
 from src.utils.logger import get_logger
 
@@ -63,21 +63,21 @@ def _tag_label(st: StockTwitsSentiment | None) -> str | None:
     return "bullish" if net > band else "bearish" if net < -band else "neutral"
 
 
-def _attention_label(reddit: RedditMention | None) -> str:
-    if reddit is None:
+def _attention_label(mentions: ApeWisdomMention | None) -> str:
+    if mentions is None:
         return "not ranked"
-    if reddit.mentions < config.ATTENTION_MIN_MENTIONS:
+    if mentions.mentions < config.ATTENTION_MIN_MENTIONS:
         return "low"
-    if not reddit.mentions_24h_ago:
+    if not mentions.mentions_24h_ago:
         return "rising"
-    change = reddit.mentions / reddit.mentions_24h_ago - 1
+    change = mentions.mentions / mentions.mentions_24h_ago - 1
     band = config.ATTENTION_CHANGE_BAND
     return "rising" if change > band else "falling" if change < -band else "stable"
 
 
 def _format_context(
     st: StockTwitsSentiment | None,
-    reddit: RedditMention | None,
+    mentions: ApeWisdomMention | None,
     trending: bool | None,
     markets: list[PolymarketMarket] | None,
 ) -> str:
@@ -88,10 +88,10 @@ def _format_context(
             f"{st.bullish} tagged bullish, {st.bearish} tagged bearish, {st.untagged} untagged"
         )
         lines += [f"  - {m[:200]}" for m in st.messages[: config.SENTIMENT_MESSAGES_FOR_LLM]]
-    if reddit is not None:
+    if mentions is not None:
         lines.append(
-            f"Reddit (ApeWisdom): rank {reddit.rank}, {reddit.mentions} mentions in 24h "
-            f"(prior 24h: {reddit.mentions_24h_ago}), rank 24h ago: {reddit.rank_24h_ago or 'n/a'}"
+            f"ApeWisdom: rank {mentions.rank}, {mentions.mentions} mentions in 24h "
+            f"(prior 24h: {mentions.mentions_24h_ago}), rank 24h ago: {mentions.rank_24h_ago or 'n/a'}"
         )
     if trending is not None:
         lines.append(f"Trending on StockTwits now: {'yes' if trending else 'no'}")
@@ -113,7 +113,7 @@ def analyze_sentiment(ticker: str) -> AgentScore:
     data_gaps: list[str] = []
 
     st = _fetch("StockTwits posts", fetch_stocktwits_sentiment, ticker, data_gaps)
-    reddit = _fetch("Reddit mentions", fetch_reddit_mentions, ticker, data_gaps)
+    mentions = _fetch("ApeWisdom mentions", fetch_mentions, ticker, data_gaps)
     trending_list = _fetch("StockTwits trending", lambda _: fetch_stocktwits_trending(), ticker, data_gaps)
     markets = _fetch("Polymarket", fetch_polymarket_markets, ticker, data_gaps)
     trending = None if trending_list is None else ticker in {t.symbol for t in trending_list}
@@ -130,14 +130,14 @@ def analyze_sentiment(ticker: str) -> AgentScore:
             data_gaps=data_gaps,
         )
 
-    tag, attention = _tag_label(st), _attention_label(reddit)
+    tag, attention = _tag_label(st), _attention_label(mentions)
     labels_text = (
         f"tagged sentiment: {tag or 'not assessable (too few tagged posts)'}; "
-        f"Reddit attention: {attention}"
+        f"ApeWisdom attention: {attention}"
     )
     user_prompt = f"""Assess retail sentiment for {ticker}.
 
-{_format_context(st, reddit, trending, markets)}
+{_format_context(st, mentions, trending, markets)}
 
 Computed assessment (facts): {labels_text}"""
 
