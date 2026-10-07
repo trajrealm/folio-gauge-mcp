@@ -96,10 +96,11 @@ def compute_confidence(coverage: float, signals: list[int]) -> float:
     """
     Confidence from data coverage (0-1) and agreement of an analyst's
     sub-assessments, each mapped to -1 (bearish), 0 or +1 (bullish).
-    Agreement is 1 when all signals match, 0.5 one step apart, 0 when opposed.
-    LLM self-reported confidence is not used: it anchors to a constant.
+    Agreement is 1 when all signals match, 0.5 one step apart, 0 when opposed
+    or when there are no signals. LLM self-reported confidence is not used:
+    it anchors to a constant.
     """
-    agreement = 1 - (max(signals) - min(signals)) / 2
+    agreement = 1 - (max(signals) - min(signals)) / 2 if signals else 0
     return round(coverage * (0.5 + 0.5 * agreement), 2)
 
 

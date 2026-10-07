@@ -45,6 +45,7 @@ QUARTERLY_METRICS = ("eps_diluted", "revenue", "net_income")
 # not_stated guidance carries no signal and is left out.
 SIGNALS = {
     "strong": 1, "solid": 1, "flat": 0, "declining": -1,
+    "accelerating": 1, "steady": 0, "decelerating": -1,
     "raised": 1, "maintained": 0, "lowered": -1, "withdrawn": -1,
     "high": 1, "medium": 0, "low": -1,
 }  # fmt: skip
@@ -52,9 +53,7 @@ SIGNALS = {
 
 class EarningsAnalysis(BaseModel):
     score: int = Field(ge=1, le=5, description="1=strong bearish, 3=neutral, 5=strong bullish")
-    eps_trend: Literal["strong", "solid", "flat", "declining"]
     guidance_signal: Literal["raised", "maintained", "lowered", "withdrawn", "not_stated"]
-    quality_assessment: Literal["high", "medium", "low"]
     reasoning: str = Field(description="2-3 sentence explanation")
     key_signals: list[str]
     risk_flags: list[str]
@@ -80,6 +79,45 @@ def _series_line(metric: str, series: dict[str, float], count: int = 4) -> str:
     return f"  {metric}: " + ", ".join(parts)
 
 
+def _latest_yoy(series: dict[str, float]) -> float | None:
+    latest = max(series, default=None)
+    prior = series.get(_prior_year(latest)) if latest else None
+    return (series[latest] - prior) / abs(prior) if prior else None
+
+
+def _eps_trend(facts: EarningsFacts) -> str | None:
+    """Latest annual diluted EPS YoY against config.EARNINGS_EPS_BANDS."""
+    growth = _latest_yoy(facts.annual.get("eps_diluted", {}))
+    if growth is None:
+        return None
+    strong, solid, flat = config.EARNINGS_EPS_BANDS
+    return "strong" if growth > strong else "solid" if growth >= solid else "flat" if growth >= flat else "declining"
+
+
+def _momentum(facts: EarningsFacts) -> str | None:
+    """Latest quarterly EPS YoY vs latest annual EPS YoY (config.EARNINGS_MOMENTUM_BAND)."""
+    annual = _latest_yoy(facts.annual.get("eps_diluted", {}))
+    quarterly = _latest_yoy(facts.quarterly.get("eps_diluted", {}))
+    if annual is None or quarterly is None:
+        return None
+    gap, band = quarterly - annual, config.EARNINGS_MOMENTUM_BAND
+    return "accelerating" if gap > band else "decelerating" if gap < -band else "steady"
+
+
+def _cash_quality(facts: EarningsFacts) -> str | None:
+    """Latest annual operating cash flow / net income; None for financials."""
+    if facts.is_financial:
+        return None
+    ocf = facts.annual.get("operating_cash_flow", {})
+    net_income = facts.annual.get("net_income", {})
+    latest = max(set(ocf) & set(net_income), default=None)
+    if latest is None or net_income[latest] <= 0:
+        return None
+    ratio = ocf[latest] / net_income[latest]
+    high, low = config.EARNINGS_CASH_CONVERSION
+    return "high" if ratio >= high else "low" if ratio < low else "medium"
+
+
 def _format_financials(facts: EarningsFacts) -> str:
     annual = facts.annual
     if facts.is_financial:
@@ -103,7 +141,7 @@ def _format_financials(facts: EarningsFacts) -> str:
         _series_line(m, facts.quarterly[m]) for m in QUARTERLY_METRICS if facts.quarterly.get(m)
     ]
     if facts.is_financial:
-        lines.append("Financial company: cash flow is omitted; judge quality from the narrative.")
+        lines.append("Financial company: cash flow is omitted as not meaningful.")
     return "\n".join(lines)
 
 
@@ -133,8 +171,9 @@ def analyze_earnings(ticker: str) -> AgentScore:
     Flow:
       1. Fetch XBRL financials and format them with YoY growth
       2. Ingest new filing narrative into Qdrant and query it
-      3. LLM produces a structured score; decision is derived from the score
-      4. Confidence = source coverage x agreement of the sub-assessments
+      3. Compute EPS trend, quarterly momentum and cash-conversion quality labels in code
+      4. LLM reads guidance from the narrative and scores; decision is derived from the score
+      5. Confidence = source coverage x agreement of EPS trend, momentum, guidance and quality
     """
     data_gaps: list[str] = []
 
@@ -158,6 +197,13 @@ def analyze_earnings(ticker: str) -> AgentScore:
             data_gaps=data_gaps,
         )
 
+    eps_trend, momentum, quality = _eps_trend(facts), _momentum(facts), _cash_quality(facts)
+    labels_text = (
+        f"EPS trend (latest annual YoY): {eps_trend or 'not assessable'}; "
+        f"quarterly momentum (latest quarter vs annual EPS YoY): {momentum or 'not assessable'}; "
+        f"earnings quality (cash conversion): {quality or 'not assessable'}"
+    )
+
     context = []
     if facts.annual:
         context.append(f"=== Reported financials (XBRL) ===\n{_format_financials(facts)}")
@@ -169,6 +215,7 @@ All financials are reported actuals, oldest to newest; the last period is the mo
 
 {context_text}
 
+Computed assessment (facts): {labels_text}
 Data gaps: {", ".join(data_gaps) or "none"}"""
 
     llm = ChatOpenAI(model=config.LLM_MODEL_AGENTS, temperature=config.LLM_TEMPERATURE_AGENTS)
@@ -182,17 +229,10 @@ Data gaps: {", ".join(data_gaps) or "none"}"""
 
     sources = [bool(facts.annual), *(t in narrative for t in NARRATIVE_QUESTIONS)]
     coverage = sum(sources) / len(sources)
-    signals = [
-        SIGNALS[v]
-        for v in (analysis.eps_trend, analysis.guidance_signal, analysis.quality_assessment)
-        if v in SIGNALS
-    ]
+    labels = (eps_trend, momentum, analysis.guidance_signal, quality)
+    signals = [SIGNALS[v] for v in labels if v in SIGNALS]
 
-    parts = [
-        analysis.reasoning,
-        f"EPS trend: {analysis.eps_trend}; guidance: {analysis.guidance_signal}; "
-        f"earnings quality: {analysis.quality_assessment}.",
-    ]
+    parts = [analysis.reasoning, f"{labels_text}; guidance: {analysis.guidance_signal}."]
     if analysis.key_signals:
         parts.append("Key signals: " + ", ".join(analysis.key_signals) + ".")
     if analysis.risk_flags:

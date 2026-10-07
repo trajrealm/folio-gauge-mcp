@@ -95,7 +95,37 @@ NEWS_PER_NEWS_SOURCE: int = 5
 NEWS_PER_REUTERS_SOURCE: int = 3
 
 # Peers Analysis
-PEERS_LOOKUP_LIMIT: int = 10
+PEERS_COUNT: int = 5
+PEERS_MIN_INDUSTRY: int = 3  # fewer industry peers than this -> fill from sector
+PEERS_MIN_WEIGHT_RATIO: float = 0.1  # peer market weight >= 10% of the target's
+PEERS_PREMIUM_BAND: float = 0.15  # median premium beyond +/-15% -> premium/discount
+PEERS_QUALITY_NET: int = 2  # (metrics above median - below) >= 2 -> stronger, <= -2 -> weaker
+
+# Fundamentals labels: metric -> (bullish, bearish) threshold.
+# bullish < bearish means lower is better. Each metric votes +1/0/-1;
+# the mean vote beyond +/-LABEL_VOTE_BAND sets the label.
+FUNDAMENTALS_RULES: dict[str, dict[str, tuple[float, float]]] = {
+    "valuation": {
+        "forward_pe": (15, 25),
+        "peg_ratio": (1.0, 2.0),
+        "ev_to_ebitda": (10, 20),
+        "free_cash_flow_yield": (0.05, 0.02),
+    },
+    "profitability": {
+        "return_on_equity": (0.15, 0.08),
+        "operating_margin": (0.20, 0.10),
+    },
+    "financial_health": {
+        "debt_to_equity": (1.0, 2.0),
+        "current_ratio": (1.5, 1.0),
+    },
+}
+LABEL_VOTE_BAND: float = 0.33
+
+# Earnings labels
+EARNINGS_EPS_BANDS: tuple[float, float, float] = (0.15, 0.05, -0.05)  # strong / solid / flat / declining
+EARNINGS_CASH_CONVERSION: tuple[float, float] = (0.9, 0.7)  # OCF/NI >= 0.9 high, < 0.7 low
+EARNINGS_MOMENTUM_BAND: float = 0.10  # latest quarter EPS YoY vs annual YoY beyond +/-10pp
 
 # Polymarket
 POLY_DEFAULT_EVENT_LIMIT: int = 10

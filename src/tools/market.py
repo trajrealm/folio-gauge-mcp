@@ -20,6 +20,8 @@ class CompanyProfile(BaseModel):
     name: str
     sector: str | None
     industry: str | None
+    sector_key: str | None  # yfinance key for yf.Sector
+    industry_key: str | None  # yfinance key for yf.Industry
     market_cap: float | None
     employees: int | None
     description: str | None
@@ -93,6 +95,8 @@ def get_ticker_snapshot(symbol: str) -> TickerSnapshot:
             name=info.get("longName") or info.get("shortName") or symbol,
             sector=info.get("sector"),
             industry=info.get("industry"),
+            sector_key=info.get("sectorKey"),
+            industry_key=info.get("industryKey"),
             market_cap=info.get("marketCap"),
             employees=info.get("fullTimeEmployees"),
             description=info.get("longBusinessSummary"),

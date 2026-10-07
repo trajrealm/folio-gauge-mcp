@@ -2,15 +2,14 @@
 src/analysts/fundamentals.py
 Fundamentals Analyst Agent
 
-Scores valuation, profitability and financial health from yfinance ratios,
-in the context of the company's sector. Growth is used only to judge
-valuation; the growth trend and earnings quality belong to the earnings
-analyst. Errors propagate to the caller.
+Scores valuation, profitability and financial health from yfinance ratios.
+The three labels are computed in code (config.FUNDAMENTALS_RULES) and given
+to the LLM as facts; the LLM weighs them in the sector context and scores.
+Growth is used only to judge valuation; the growth trend and earnings
+quality belong to the earnings analyst. Errors propagate to the caller.
 """
 
 from __future__ import annotations
-
-from typing import Literal
 
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
@@ -41,19 +40,49 @@ METRICS: list[tuple[str, str, str]] = [
 ]
 
 
+# Label names for a mean vote of +1 / 0 / -1 per area.
+LABELS = {
+    "valuation": ("cheap", "fair", "expensive"),
+    "profitability": ("strong", "average", "weak"),
+    "financial_health": ("strong", "adequate", "weak"),
+}
+
+
 class FundamentalsAnalysis(BaseModel):
     score: int = Field(ge=1, le=5, description="1=unattractive, 3=fairly valued, 5=attractive")
-    valuation: Literal["cheap", "fair", "expensive"]
-    profitability: Literal["strong", "average", "weak"]
-    financial_health: Literal["strong", "adequate", "weak"]
     reasoning: str = Field(description="2-3 sentence explanation")
     key_signals: list[str]
     risk_flags: list[str]
 
-SIGNALS = {
-    "cheap": 1, "fair": 0, "expensive": -1,
-    "strong": 1, "average": 0, "adequate": 0, "weak": -1,
-}  # fmt: skip
+
+def _vote(value: float, bullish: float, bearish: float) -> int:
+    """+1 / 0 / -1 for one metric. bullish < bearish means lower is better."""
+    if bullish < bearish:
+        if value <= 0:  # negative multiple or yield: losses
+            return -1
+        return 1 if value < bullish else -1 if value > bearish else 0
+    return 1 if value > bullish else -1 if value < bearish else 0
+
+
+def _area_signals(fundamentals: Fundamentals) -> dict[str, int | None]:
+    """Mean metric vote per area -> +1 / 0 / -1, or None if no metric available."""
+    signals: dict[str, int | None] = {}
+    for area, rules in config.FUNDAMENTALS_RULES.items():
+        votes = [
+            _vote(getattr(fundamentals, m), *bands)
+            for m, bands in rules.items()
+            if getattr(fundamentals, m) is not None
+        ]
+        if not votes:
+            signals[area] = None
+            continue
+        mean = sum(votes) / len(votes)
+        signals[area] = 1 if mean > config.LABEL_VOTE_BAND else -1 if mean < -config.LABEL_VOTE_BAND else 0
+    return signals
+
+
+def _label(area: str, signal: int | None) -> str:
+    return "not assessable" if signal is None else LABELS[area][1 - signal]
 
 
 def _format_metrics(fundamentals: Fundamentals) -> str:
@@ -74,8 +103,9 @@ def analyze_fundamentals(ticker: str) -> AgentScore:
     """
     Flow:
       1. Fetch the yfinance snapshot (profile + fundamentals)
-      2. LLM produces a structured score; decision is derived from the score
-      3. Confidence = metric coverage x agreement of the three sub-assessments
+      2. Compute valuation / profitability / health labels from rule votes
+      3. LLM produces a structured score; decision is derived from the score
+      4. Confidence = metric coverage x agreement of the three labels
     """
     snapshot = get_ticker_snapshot(ticker)
     fundamentals = snapshot.fundamentals
@@ -93,12 +123,18 @@ def analyze_fundamentals(ticker: str) -> AgentScore:
             data_gaps=["No fundamentals data from yfinance"],
         )
 
+    signals = _area_signals(fundamentals)
+    labels = {area: _label(area, signal) for area, signal in signals.items()}
+    labels_text = "; ".join(f"{area.replace('_', ' ')}: {label}" for area, label in labels.items())
+
     profile = snapshot.profile
     market_cap = f"{profile.market_cap / 1e9:,.1f}B" if profile.market_cap else "n/a"
     user_prompt = f"""Analyze the fundamentals of {ticker} ({profile.name}).
 Sector: {profile.sector or "n/a"}; industry: {profile.industry or "n/a"}; market cap: {market_cap}
 
-{_format_metrics(fundamentals)}"""
+{_format_metrics(fundamentals)}
+
+Computed assessment (facts): {labels_text}"""
 
     llm = ChatOpenAI(model=config.LLM_MODEL_AGENTS, temperature=config.LLM_TEMPERATURE_AGENTS)
     analysis: FundamentalsAnalysis = llm.with_structured_output(FundamentalsAnalysis).invoke(
@@ -110,13 +146,8 @@ Sector: {profile.sector or "n/a"}; industry: {profile.industry or "n/a"}; market
     )
 
     coverage = 1 - len(data_gaps) / len(METRICS)
-    signals = [SIGNALS[analysis.valuation], SIGNALS[analysis.profitability], SIGNALS[analysis.financial_health]]
 
-    parts = [
-        analysis.reasoning,
-        f"Valuation: {analysis.valuation}; profitability: {analysis.profitability}; "
-        f"financial health: {analysis.financial_health}.",
-    ]
+    parts = [analysis.reasoning, labels_text[0].upper() + labels_text[1:] + "."]
     if analysis.key_signals:
         parts.append("Key signals: " + ", ".join(analysis.key_signals) + ".")
     if analysis.risk_flags:
@@ -129,6 +160,6 @@ Sector: {profile.sector or "n/a"}; industry: {profile.industry or "n/a"}; market
         score=analysis.score,
         timeframe="long",
         reasoning="Fundamentals: " + " ".join(parts),
-        confidence=compute_confidence(coverage, signals),
+        confidence=compute_confidence(coverage, [v for v in signals.values() if v is not None]),
         data_gaps=[f"Missing: {', '.join(data_gaps)}"] if data_gaps else [],
     )
