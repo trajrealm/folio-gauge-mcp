@@ -1,230 +1,170 @@
 """
 src/analysts/sentiment.py
--------------------------
-Sentiment Analyst Agent
+Sentiment Analyst Agent (retail sentiment and attention)
 
-Evaluates market psychology by combining three data sources:
-  1. Polymarket prediction markets  (src/tools/polymarket.py)
-  2. StockTwits retail sentiment    (src/tools/stocktwits.py)
-  3. RSS news feed                  (src/tools/news.py)
+Sources, each optional (a failure is logged with its stack trace and recorded
+as a data gap; the analysis continues with the rest):
+  - StockTwits posts: tag counts (code) and text tone (LLM)
+  - Attention: Reddit mentions via ApeWisdom, StockTwits trending
+  - Polymarket: non-price prediction markets, as context
 
-Passes combined context to OpenAI gpt-4o-mini for analysis.
-Uses skill and prompt from markdown files to guide reasoning.
-Returns AgentScore with sentiment outlook.
+Labels from numbers are computed in code and given to the LLM as facts.
+News belongs to the news analyst and is not used here.
 """
 
 from __future__ import annotations
 
-import os
-
-import json
-from datetime import datetime, timezone
+from typing import Callable, Literal, TypeVar
 
 from langchain_openai import ChatOpenAI
-from src.agent.scoring import AgentScore
-from src.agent.knowledge import load_skill, get_system_message
-from src.tools.polymarket import fetch_polymarket_events, PolymarketData
-from src.tools.stocktwits import fetch_stocktwits_sentiment, StockTwitsData
-from src.tools.news import get_ticker_news, NewsFeed
+from pydantic import BaseModel, Field
+
+from src.agent.knowledge import load_prompt
+from src.agent.scoring import AgentScore, compute_confidence, decision_from_score
+from src.tools.polymarket import PolymarketMarket, fetch_polymarket_markets
+from src.tools.apewisdom import RedditMention, fetch_reddit_mentions
+from src.tools.stocktwits import StockTwitsSentiment, fetch_stocktwits_sentiment, fetch_stocktwits_trending
 from src.utils.logger import get_logger
 
 from .. import config
 
 logger = get_logger(__name__)
 
-
-def _get_llm() -> ChatOpenAI:
-    return ChatOpenAI(model=config.LLM_MODEL_AGENTS, temperature=config.LLM_TEMPERATURE_AGENTS)
-
-
-def _format_polymarket(data: PolymarketData) -> str:
-    if not data.success or not data.events:
-        return "No Polymarket data available."
-
-    lines = [f"Polymarket events ({data.count} found):"]
-    for event in data.events[:5]:
-        title = event.title
-        volume = event.open_interest
-        desc = (event.description or "")[:100]
-        lines.append(f"- {title} (open interest: ${volume:,.0f})\n  {desc}")
-    return "\n".join(lines)
+T = TypeVar("T")
+SIGNALS = {"bullish": 1, "neutral": 0, "bearish": -1}
 
 
-def _format_stocktwits(data: StockTwitsData) -> str:
-    if not data.success or data.total == 0:
-        return "No StockTwits data available."
-
-    bullish_pct = (data.bullish / data.total) * 100
-    bearish_pct = (data.bearish / data.total) * 100
-
-    lines = [
-        f"StockTwits sentiment ({data.total} recent messages):",
-        f"- Bullish: {bullish_pct:.0f}% ({data.bullish} messages)",
-        f"- Bearish: {bearish_pct:.0f}% ({data.bearish} messages)",
-        "Recent messages:",
-    ]
-    for msg in data.messages[:5]:
-        lines.append(f"  • {msg[:100]}")
-    return "\n".join(lines)
+class SentimentAnalysis(BaseModel):
+    score: int = Field(ge=1, le=5, description="1=strong bearish, 3=neutral, 5=strong bullish")
+    text_tone: Literal["bullish", "neutral", "bearish", "not_assessable"] = Field(
+        description="Tone of the StockTwits post texts"
+    )
+    reasoning: str = Field(description="2-3 sentence explanation")
+    key_signals: list[str]
+    risk_flags: list[str]
 
 
-def _format_news(feed: NewsFeed, max_articles: int = 8) -> str:
-    if not feed.articles:
-        return "No recent news available."
-
-    lines = [f"Recent news (as of {feed.fetched_at[:10]}):"]
-    for article in feed.articles[:max_articles]:
-        date = article.published[:10] if article.published else "unknown date"
-        summary = f" — {article.summary}" if article.summary else ""
-        lines.append(f"[{date}] {article.source}: {article.title}{summary}")
-    return "\n".join(lines)
-
-
-def _analyze_with_llm(
-    ticker: str,
-    polymarket_data: PolymarketData,
-    stocktwits_data: StockTwitsData,
-    news_feed: NewsFeed,
-) -> tuple[float, str, float, str, list[str]]:
-    """
-    Call OpenAI gpt-4o-mini with combined context from all three sources.
-    Uses sentiment skill and prompt to guide analysis.
-    """
-    system_prompt = get_system_message("sentiment", include_skill=True)
-    
-    user_message = f"""Analyze sentiment for {ticker} based on the following market data:
-
-{_format_polymarket(polymarket_data)}
-
-{_format_stocktwits(stocktwits_data)}
-
-{_format_news(news_feed)}
-
-Return ONLY a JSON object with this exact structure, no preamble:
-{{
-  "score": <1-5, where 1=strong bearish, 3=neutral, 5=strong bullish>,
-  "decision": "<BUY|HOLD|SELL>",
-  "confidence": <0.0-1.0>,
-  "reasoning": "<2-3 sentence explanation>",
-  "key_signals": ["<signal1>", "<signal2>", ...]
-}}"""
-
+def _fetch(name: str, fn: Callable[[str], T], ticker: str, data_gaps: list[str]) -> T | None:
+    """Run one source; on failure log the stack trace, record a data gap, return None."""
     try:
-        llm = _get_llm()
-        response = llm.invoke([
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ], config={"run_name": "Sentiment Agent"})
-
-        result = json.loads(response.content)
-
-        score = max(1.0, min(5.0, float(result.get("score", 3.0))))
-        decision = result.get("decision", "HOLD").upper()
-        confidence = max(0.0, min(1.0, float(result.get("confidence", 0.5))))
-        reasoning = result.get("reasoning", "")
-        signals = result.get("key_signals", [])
-
-        return score, decision, confidence, reasoning, signals
-
+        return fn(ticker)
     except Exception as e:
-        logger.error(f"OpenAI analysis failed: {e}, falling back to heuristic")
-        return _fallback_analysis(ticker, polymarket_data, stocktwits_data)
+        logger.exception(f"{name} failed for {ticker}")
+        data_gaps.append(f"{name} unavailable: {e}")
+        return None
 
 
+def _tag_label(st: StockTwitsSentiment | None) -> str | None:
+    """Net tagged sentiment (bullish - bearish) / tagged vs config.SENTIMENT_NET_BAND."""
+    if st is None or st.bullish + st.bearish < config.SENTIMENT_MIN_TAGGED:
+        return None
+    net = (st.bullish - st.bearish) / (st.bullish + st.bearish)
+    band = config.SENTIMENT_NET_BAND
+    return "bullish" if net > band else "bearish" if net < -band else "neutral"
 
-def _fallback_analysis(
-    ticker: str,
-    polymarket_data: PolymarketData,
-    stocktwits_data: StockTwitsData,
-) -> tuple[float, str, float, str, list[str]]:
-    """
-    Heuristic fallback if the OpenAI call fails.
-    News is excluded here since it requires LLM to interpret.
-    """
-    signals = []
-    score_components = []
 
-    if stocktwits_data.success and stocktwits_data.total > 0:
-        bullish_pct = (stocktwits_data.bullish / stocktwits_data.total) * 100
-        bearish_pct = (stocktwits_data.bearish / stocktwits_data.total) * 100
+def _attention_label(reddit: RedditMention | None) -> str:
+    if reddit is None:
+        return "not ranked"
+    if reddit.mentions < config.ATTENTION_MIN_MENTIONS:
+        return "low"
+    if not reddit.mentions_24h_ago:
+        return "rising"
+    change = reddit.mentions / reddit.mentions_24h_ago - 1
+    band = config.ATTENTION_CHANGE_BAND
+    return "rising" if change > band else "falling" if change < -band else "stable"
 
-        if bullish_pct > 60:
-            signals.append(f"StockTwits bullish ({bullish_pct:.0f}%)")
-            score_components.append(4)
-        elif bearish_pct > 60:
-            signals.append(f"StockTwits bearish ({bearish_pct:.0f}%)")
-            score_components.append(2)
-        else:
-            signals.append("StockTwits mixed sentiment")
-            score_components.append(3)
 
-    if polymarket_data.success and polymarket_data.events:
-        total_volume = sum(e.open_interest for e in polymarket_data.events)
-        signals.append(f"Polymarket open interest: ${total_volume:,.0f}")
-        score_components.append(4 if total_volume > 100000 else 2 if total_volume < 10000 else 3)
-
-    score = max(1.0, min(5.0, round(
-        sum(score_components) / len(score_components) if score_components else 3.0, 1
-    )))
-
-    if score >= 4.0:
-        decision, confidence = "BUY", 0.65
-    elif score >= 3.0:
-        decision, confidence = "HOLD", 0.55
-    else:
-        decision, confidence = "SELL", 0.65
-
-    return score, decision, confidence, f"Based on {len(signals)} sentiment signals", signals
+def _format_context(
+    st: StockTwitsSentiment | None,
+    reddit: RedditMention | None,
+    trending: bool | None,
+    markets: list[PolymarketMarket] | None,
+) -> str:
+    lines = []
+    if st is not None:
+        lines.append(
+            f"StockTwits latest {st.bullish + st.bearish + st.untagged} posts: "
+            f"{st.bullish} tagged bullish, {st.bearish} tagged bearish, {st.untagged} untagged"
+        )
+        lines += [f"  - {m[:200]}" for m in st.messages[: config.SENTIMENT_MESSAGES_FOR_LLM]]
+    if reddit is not None:
+        lines.append(
+            f"Reddit (ApeWisdom): rank {reddit.rank}, {reddit.mentions} mentions in 24h "
+            f"(prior 24h: {reddit.mentions_24h_ago}), rank 24h ago: {reddit.rank_24h_ago or 'n/a'}"
+        )
+    if trending is not None:
+        lines.append(f"Trending on StockTwits now: {'yes' if trending else 'no'}")
+    if markets:
+        lines.append("Polymarket (probability of the stated outcome):")
+        lines += [f"  - {m.question} {m.outcome}: {m.probability:.0%}" for m in markets]
+    return "\n".join(lines)
 
 
 def analyze_sentiment(ticker: str) -> AgentScore:
     """
-    Analyze sentiment signals for a ticker using Polymarket, StockTwits, and News.
+    Flow:
+      1. Fetch each source independently (failures become data gaps)
+      2. Compute tagged-sentiment and attention labels in code
+      3. LLM reads post tone and scores; decision is derived from the score
+      4. Confidence = coverage x agreement of tagged sentiment and text tone
     """
     ticker = ticker.upper()
     data_gaps: list[str] = []
 
-    # Fetch from all three tools
-    polymarket_data = fetch_polymarket_events(ticker)
-    stocktwits_data = fetch_stocktwits_sentiment(ticker)
-    news_feed = get_ticker_news(ticker)
+    st = _fetch("StockTwits posts", fetch_stocktwits_sentiment, ticker, data_gaps)
+    reddit = _fetch("Reddit mentions", fetch_reddit_mentions, ticker, data_gaps)
+    trending_list = _fetch("StockTwits trending", lambda _: fetch_stocktwits_trending(), ticker, data_gaps)
+    markets = _fetch("Polymarket", fetch_polymarket_markets, ticker, data_gaps)
+    trending = None if trending_list is None else ticker in {t.symbol for t in trending_list}
 
-    # Track data gaps
-    if not polymarket_data.success:
-        data_gaps.append(f"Polymarket data unavailable: {polymarket_data.error}")
-    if not stocktwits_data.success:
-        data_gaps.append(f"StockTwits data unavailable: {stocktwits_data.error}")
-    if not news_feed.articles:
-        data_gaps.append("No news articles found")
-
-    try:
-        score, decision, confidence, reasoning, signals = _analyze_with_llm(
-            ticker, polymarket_data, stocktwits_data, news_feed
-        )
-
-        reasoning_full = f"{reasoning}\nSignals: {', '.join(signals) if signals else 'None identified'}"
-
-        return AgentScore(
-            agent="sentiment",
-            symbol=ticker,
-            decision=decision,
-            score=int(round(score)),
-            timeframe="short",
-            reasoning=reasoning_full,
-            confidence=confidence,
-            data_gaps=data_gaps,
-        )
-
-    except Exception as e:
-        logger.error(f"Sentiment analysis error: {str(e)}")
-        data_gaps.append(f"Sentiment analysis error: {str(e)}")
+    if st is None and not markets:
         return AgentScore(
             agent="sentiment",
             symbol=ticker,
             decision="HOLD",
             score=3,
             timeframe="short",
-            reasoning=f"Sentiment analysis failed: {str(e)}. Defaulting to neutral.",
-            confidence=0.2,
+            reasoning="No directional sentiment data (StockTwits unavailable, no Polymarket markets)",
+            confidence=0.1,
             data_gaps=data_gaps,
         )
+
+    tag, attention = _tag_label(st), _attention_label(reddit)
+    labels_text = (
+        f"tagged sentiment: {tag or 'not assessable (too few tagged posts)'}; "
+        f"Reddit attention: {attention}"
+    )
+    user_prompt = f"""Assess retail sentiment for {ticker}.
+
+{_format_context(st, reddit, trending, markets)}
+
+Computed assessment (facts): {labels_text}"""
+
+    llm = ChatOpenAI(model=config.LLM_MODEL_AGENTS, temperature=config.LLM_TEMPERATURE_AGENTS)
+    analysis: SentimentAnalysis = llm.with_structured_output(SentimentAnalysis).invoke(
+        [
+            {"role": "system", "content": load_prompt("sentiment")},
+            {"role": "user", "content": user_prompt},
+        ],
+        config={"run_name": "Sentiment Agent"},
+    )
+
+    signals = [SIGNALS[v] for v in (tag, analysis.text_tone) if v in SIGNALS]
+
+    parts = [analysis.reasoning, f"{labels_text[0].upper() + labels_text[1:]}; text tone: {analysis.text_tone}."]
+    if analysis.key_signals:
+        parts.append("Key signals: " + ", ".join(analysis.key_signals) + ".")
+    if analysis.risk_flags:
+        parts.append("Risks: " + ", ".join(analysis.risk_flags) + ".")
+
+    return AgentScore(
+        agent="sentiment",
+        symbol=ticker,
+        decision=decision_from_score(analysis.score),
+        score=analysis.score,
+        timeframe="short",
+        reasoning="Sentiment: " + " ".join(parts),
+        confidence=compute_confidence(len(signals) / 2, signals),
+        data_gaps=data_gaps,
+    )

@@ -42,9 +42,8 @@ from qdrant_client.models import (
     PointStruct,
     VectorParams,
 )
-from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
-
 from .. import config
+from ..utils.http import retry_transient
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -120,21 +119,7 @@ class FilingQueryResult(BaseModel):
     filed_dates: list[str]
 
 
-def _is_transient(exc: BaseException) -> bool:
-    if isinstance(exc, httpx.HTTPStatusError):
-        return exc.response.status_code == 429 or exc.response.status_code >= 500
-    return isinstance(exc, httpx.TransportError)
-
-
-_retry_transient = retry(
-    retry=retry_if_exception(_is_transient),
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=8),
-    reraise=True,
-)
-
-
-@_retry_transient
+@retry_transient
 def _get(url: str) -> dict:
     """GET JSON with retry on transient errors and polite rate limiting."""
     time.sleep(0.15)
@@ -143,7 +128,7 @@ def _get(url: str) -> dict:
     return response.json()
 
 
-@_retry_transient
+@retry_transient
 def _get_text(url: str) -> str:
     """GET raw text (for HTML filing docs)."""
     time.sleep(0.15)

@@ -14,7 +14,8 @@ import os
 from dataclasses import dataclass
 
 from src.agent.knowledge import get_system_message
-from src.tools.trends import fetch_reddit_mentions, fetch_stocktwits_trending
+from src.tools.apewisdom import fetch_reddit_top
+from src.tools.stocktwits import fetch_stocktwits_trending
 from src.utils.logger import get_logger
 from langchain_openai import ChatOpenAI
 
@@ -79,9 +80,7 @@ def _discover_with_llm(limit: int) -> DiscoveryResult:
     stocktwits_data = []
     
     try:
-        reddit_trending = fetch_reddit_mentions("all-stocks")
-        if reddit_trending:
-            reddit_data = [reddit_trending.ticker]
+        reddit_data = [m.symbol for m in fetch_reddit_top(limit=5)]
     except Exception as e:
         logger.warning(f"Reddit fetch failed: {e}")
     
@@ -156,9 +155,7 @@ def _discover_fallback(limit: int) -> DiscoveryResult:
     stocktwits_data = []
     
     try:
-        reddit_trending = fetch_reddit_mentions("all-stocks")
-        if reddit_trending:
-            reddit_data = [reddit_trending.ticker]
+        reddit_data = [m.symbol for m in fetch_reddit_top(limit=5)]
     except:
         logger.warning("Reddit fetch failed in fallback")
         pass

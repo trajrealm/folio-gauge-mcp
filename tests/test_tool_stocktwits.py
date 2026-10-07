@@ -1,78 +1,32 @@
 """
 test_tool_stocktwits.py
 -----------------------
-Tests src/tools/stocktwits.py (StockTwits retail sentiment fetcher).
+Smoke-tests src/tools/stocktwits.py. No API key required.
+StockTwits sometimes answers 403 (bot protection); retry later if so.
 Run from project root:
-    uv run python tests/test_tool_stocktwits.py
+    uv run python -m tests.test_tool_stocktwits [TICKER]
 """
 
-from dotenv import load_dotenv
-load_dotenv()
+import sys
 
-TICKER = "AAPL"
+from src.tools.stocktwits import fetch_stocktwits_sentiment, fetch_stocktwits_trending
 
-print(f"\n{'='*60}")
-print(f"  stocktwits.py tool — {TICKER}")
-print(f"{'='*60}\n")
+TICKER = sys.argv[1] if len(sys.argv) > 1 else "AAPL"
 
-from src.tools.stocktwits import fetch_stocktwits_sentiment
+print(f"\n== stocktwits.py tool - {TICKER} ==\n")
 
-data = fetch_stocktwits_sentiment(TICKER)
+st = fetch_stocktwits_sentiment(TICKER)
+print(f"  bullish={st.bullish} bearish={st.bearish} untagged={st.untagged}")
+for m in st.messages[:5]:
+    print(f"    - {m[:100]}")
+trending = fetch_stocktwits_trending(10)
+print(f"\n  Trending: {[t.symbol for t in trending]}\n")
 
-print(f"  Symbol:      {data.symbol}")
-print(f"  Success:     {data.success}")
-print(f"  Total Msgs:  {data.total}")
-
-if data.error:
-    print(f"  Error:       {data.error}")
-
-# ---------------------------------------------------------------------------
-# Sentiment breakdown
-# ---------------------------------------------------------------------------
-
-if data.total > 0:
-    bullish_pct = (data.bullish / data.total) * 100
-    bearish_pct = (data.bearish / data.total) * 100
-    neutral_pct = (data.neutral / data.total) * 100
-
-    print(f"\n  {'─'*56}")
-    print(f"  Sentiment Breakdown")
-    print(f"  {'─'*56}")
-    print(f"  Bullish:     {bullish_pct:.0f}% ({data.bullish})")
-    print(f"  Bearish:     {bearish_pct:.0f}% ({data.bearish})")
-    print(f"  Neutral:     {neutral_pct:.0f}% ({data.neutral})")
-
-# ---------------------------------------------------------------------------
-# Recent messages
-# ---------------------------------------------------------------------------
-
-if data.messages:
-    print(f"\n  {'─'*56}")
-    print(f"  Recent Messages (up to 5 of {len(data.messages)})")
-    print(f"  {'─'*56}")
-    for i, msg in enumerate(data.messages[:5], 1):
-        print(f"  [{i}] {msg[:100]}")
-
-# ---------------------------------------------------------------------------
-# Validation
-# ---------------------------------------------------------------------------
-
-validation = {
-    "success":           data.success,
-    "messages_found":    data.total > 0,
-    "has_message_texts": len(data.messages) > 0,
-    "symbol_correct":    data.symbol == TICKER,
-    "counts_add_up":     (data.bullish + data.bearish + data.neutral) == data.total,
+checks = {
+    "Posts returned": bool(st.messages),
+    "Counts add up": st.bullish + st.bearish + st.untagged == len(st.messages),
+    "Trending list returned": bool(trending),
 }
-
-issues = [k for k, v in validation.items() if not v]
-
-print()
-print(f"  {'─'*56}")
-if issues:
-    print(f"  ⚠️   Issues:")
-    for issue in issues:
-        print(f"        - {issue}")
-else:
-    print(f"  ✅  All key fields returned data")
+for label, ok in checks.items():
+    print(f"  [{'PASS' if ok else 'FAIL'}] {label}")
 print()

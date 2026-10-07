@@ -1,92 +1,52 @@
 """
 src/tools/stocktwits.py
 -----------------------
-Fetches retail sentiment data from StockTwits for a given ticker.
-Returns structured data only — no analysis or LLM calls.
+StockTwits public API (no key): recent posts for a ticker with their
+bullish/bearish tags, and the currently trending symbols.
+StockTwits sometimes answers 403 (bot protection); that error is raised.
 """
 
 from __future__ import annotations
 
-import httpx
 from pydantic import BaseModel
-from tenacity import retry, stop_after_attempt, wait_exponential
-from typing import Optional
-from ..utils.logger import get_logger
 
-logger = get_logger(__name__)
+from ..utils.http import get_json
 
-class StockTwitsData(BaseModel):
-    """Result from fetching StockTwits sentiment for a ticker."""
+_BASE = "https://api.stocktwits.com/api/2"
+_HEADERS = {"User-Agent": "folio-gauge/1.0"}
 
-    success: bool
+
+class StockTwitsSentiment(BaseModel):
     symbol: str
-    bullish: int
+    bullish: int  # posts tagged Bullish by their author
     bearish: int
-    neutral: int
-    total: int
-    messages: list[str]  
-    error: Optional[str] = None
+    untagged: int
+    messages: list[str]  # newest first
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=5))
-def fetch_stocktwits_sentiment(ticker: str) -> StockTwitsData:
-    """
-    Fetch StockTwits sentiment data for a ticker.
-    """
+class StockTwitsTrending(BaseModel):
+    symbol: str
+    watchlist_count: int
+
+
+def fetch_stocktwits_sentiment(ticker: str) -> StockTwitsSentiment:
+    """Latest posts (up to 30) for a ticker and their tag counts."""
     ticker = ticker.upper()
+    messages = get_json(f"{_BASE}/streams/symbol/{ticker}.json", headers=_HEADERS)["messages"]
+    tags = [((m.get("entities") or {}).get("sentiment") or {}).get("basic") for m in messages]
+    return StockTwitsSentiment(
+        symbol=ticker,
+        bullish=tags.count("Bullish"),
+        bearish=tags.count("Bearish"),
+        untagged=sum(t not in ("Bullish", "Bearish") for t in tags),
+        messages=[m["body"] for m in messages],
+    )
 
-    try:
-        url = f"https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json"
-        response = httpx.get(
-            url,
-            headers={"User-Agent": "folio-gauge/1.0"},
-            timeout=10,
-        )
-        response.raise_for_status()
-        data = response.json()
 
-        messages = data.get("messages", [])
-
-        bullish_count = 0
-        bearish_count = 0
-        neutral_count = 0
-        message_texts = []
-
-        for m in messages:
-            text = m.get("body", "")
-            message_texts.append(text)
-
-            sentiment = m.get("entities", {}).get("sentiment", {})
-            if sentiment:
-                basic = sentiment.get("basic")
-                if basic == "Bullish":
-                    bullish_count += 1
-                elif basic == "Bearish":
-                    bearish_count += 1
-                else:
-                    neutral_count += 1
-            else:
-                neutral_count += 1
-
-        return StockTwitsData(
-            success=True,
-            symbol=ticker,
-            bullish=bullish_count,
-            bearish=bearish_count,
-            neutral=neutral_count,
-            total=len(messages),
-            messages=message_texts[:20],
-        )
-
-    except Exception as e:
-        logger.error(f"Error fetching StockTwits sentiment for {ticker}: {e}")
-        return StockTwitsData(
-            success=False,
-            symbol=ticker,
-            bullish=0,
-            bearish=0,
-            neutral=0,
-            total=0,
-            messages=[],
-            error=str(e),
-        )
+def fetch_stocktwits_trending(limit: int = 30) -> list[StockTwitsTrending]:
+    """Symbols trending on StockTwits right now."""
+    symbols = get_json(f"{_BASE}/trending/symbols.json", headers=_HEADERS)["symbols"]
+    return [
+        StockTwitsTrending(symbol=s["symbol"].upper(), watchlist_count=s["watchlist_count"])
+        for s in symbols[:limit]
+    ]

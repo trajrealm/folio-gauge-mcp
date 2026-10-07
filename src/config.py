@@ -79,7 +79,7 @@ FRED_DEFAULT_MULTISERIES_LIMIT: int = 100
 FRED_CPI_LOOKBACK_MONTHS: int = 13
 FRED_GDP_LOOKBACK_QUARTERS: int = 2
 
-# Trends (Reddit / StockTwits attention; used by discovery)
+# Attention: Reddit mentions via ApeWisdom (no key), StockTwits trending
 REDDIT_FILTER: str = "all-stocks"
 
 # Return lookbacks in trading days (technical and sector)
@@ -155,10 +155,18 @@ EARNINGS_EPS_BANDS: tuple[float, float, float] = (0.15, 0.05, -0.05)  # strong /
 EARNINGS_CASH_CONVERSION: tuple[float, float] = (0.9, 0.7)  # OCF/NI >= 0.9 high, < 0.7 low
 EARNINGS_MOMENTUM_BAND: float = 0.10  # latest quarter EPS YoY vs annual YoY beyond +/-10pp
 
-# Polymarket
+# Polymarket: markets matching this are dropped - price bets (any question with
+# a dollar price level, or "Up or Down": they mirror the current price, not
+# sentiment) and unnamed placeholder outcomes ("Candidate A", "Other").
 POLY_DEFAULT_EVENT_LIMIT: int = 10
-POLY_CONFIDENCE_CALC_WEIGHT: tuple[float, float, float] = (0.4, 0.3, 0.3)
-POLY_NORMALIZATION_DIVISOR: float = 5.0
+POLY_SKIP_PATTERN: str = r"\$\s?\d|up or down|candidate [a-z]\b|will other\b"
+
+# Sentiment labels
+SENTIMENT_MIN_TAGGED: int = 5  # fewer bullish/bearish-tagged StockTwits posts -> not assessable
+SENTIMENT_NET_BAND: float = 0.2  # (bullish - bearish) / tagged beyond +/-0.2
+SENTIMENT_MESSAGES_FOR_LLM: int = 10
+ATTENTION_MIN_MENTIONS: int = 10  # fewer Reddit mentions -> "low" attention
+ATTENTION_CHANGE_BAND: float = 0.25  # 24h mention change beyond +/-25% -> rising/falling
 
 # Portfolio
 PORTFOLIO_CSV_COLUMNS: tuple[str, ...] = ("symbol", "qty", "avg_cost", "type")
