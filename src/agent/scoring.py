@@ -92,6 +92,17 @@ def decision_from_score(weighted_score: float) -> str:
         return "SELL"
 
 
+def compute_confidence(coverage: float, signals: list[int]) -> float:
+    """
+    Confidence from data coverage (0-1) and agreement of an analyst's
+    sub-assessments, each mapped to -1 (bearish), 0 or +1 (bullish).
+    Agreement is 1 when all signals match, 0.5 one step apart, 0 when opposed.
+    LLM self-reported confidence is not used: it anchors to a constant.
+    """
+    agreement = 1 - (max(signals) - min(signals)) / 2
+    return round(coverage * (0.5 + 0.5 * agreement), 2)
+
+
 def _majority_timeframe(scores: list[AgentScore]) -> str:
     """Return the most common timeframe across all agent scores."""
     counts: dict[str, int] = {}

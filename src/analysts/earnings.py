@@ -21,7 +21,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from src.agent.knowledge import load_prompt
-from src.agent.scoring import AgentScore, decision_from_score
+from src.agent.scoring import AgentScore, compute_confidence, decision_from_score
 from src.tools.edgar import EarningsFacts, get_earnings_facts, ingest_filings, query_filings
 
 from .. import config
@@ -42,10 +42,16 @@ NARRATIVE_QUESTIONS = {
 
 QUARTERLY_METRICS = ("eps_diluted", "revenue", "net_income")
 
+# not_stated guidance carries no signal and is left out.
+SIGNALS = {
+    "strong": 1, "solid": 1, "flat": 0, "declining": -1,
+    "raised": 1, "maintained": 0, "lowered": -1, "withdrawn": -1,
+    "high": 1, "medium": 0, "low": -1,
+}  # fmt: skip
+
 
 class EarningsAnalysis(BaseModel):
     score: int = Field(ge=1, le=5, description="1=strong bearish, 3=neutral, 5=strong bullish")
-    confidence: float = Field(ge=0.0, le=1.0)
     eps_trend: Literal["strong", "solid", "flat", "declining"]
     guidance_signal: Literal["raised", "maintained", "lowered", "withdrawn", "not_stated"]
     quality_assessment: Literal["high", "medium", "low"]
@@ -128,6 +134,7 @@ def analyze_earnings(ticker: str) -> AgentScore:
       1. Fetch XBRL financials and format them with YoY growth
       2. Ingest new filing narrative into Qdrant and query it
       3. LLM produces a structured score; decision is derived from the score
+      4. Confidence = source coverage x agreement of the sub-assessments
     """
     data_gaps: list[str] = []
 
@@ -173,6 +180,14 @@ Data gaps: {", ".join(data_gaps) or "none"}"""
         config={"run_name": "Earnings Agent"},
     )
 
+    sources = [bool(facts.annual), *(t in narrative for t in NARRATIVE_QUESTIONS)]
+    coverage = sum(sources) / len(sources)
+    signals = [
+        SIGNALS[v]
+        for v in (analysis.eps_trend, analysis.guidance_signal, analysis.quality_assessment)
+        if v in SIGNALS
+    ]
+
     parts = [
         analysis.reasoning,
         f"EPS trend: {analysis.eps_trend}; guidance: {analysis.guidance_signal}; "
@@ -190,6 +205,6 @@ Data gaps: {", ".join(data_gaps) or "none"}"""
         score=analysis.score,
         timeframe="mid",
         reasoning="Earnings: " + " ".join(parts),
-        confidence=analysis.confidence,
+        confidence=compute_confidence(coverage, signals),
         data_gaps=data_gaps,
     )

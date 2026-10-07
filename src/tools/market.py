@@ -1,17 +1,18 @@
 """
 tools/market.py
 ---------------
-Market data via yfinance — price, fundamentals, earnings, analyst ratings.
+Market data via yfinance - profile, price, fundamentals, analyst ratings.
 No API key required.
+
+Units: ratios and rates are fractions (0.25 = 25%), debt_to_equity is a
+multiple (0.78 = 0.78x). yfinance reports debtToEquity and dividendYield as
+percents, so those two are divided by 100 here.
 """
 
 from __future__ import annotations
 
 import yfinance as yf
 from pydantic import BaseModel
-from ..utils.logger import get_logger
-
-logger = get_logger(__name__)
 
 
 class CompanyProfile(BaseModel):
@@ -29,14 +30,19 @@ class Fundamentals(BaseModel):
     symbol: str
     pe_ratio: float | None
     forward_pe: float | None
+    peg_ratio: float | None
     price_to_book: float | None
-    debt_to_equity: float | None
-    return_on_equity: float | None
-    profit_margin: float | None
-    revenue_growth: float | None
-    earnings_growth: float | None
+    ev_to_ebitda: float | None
+    free_cash_flow_yield: float | None  # fraction
+    debt_to_equity: float | None  # multiple
     current_ratio: float | None
     quick_ratio: float | None
+    return_on_equity: float | None  # fraction
+    return_on_assets: float | None  # fraction
+    operating_margin: float | None  # fraction
+    profit_margin: float | None  # fraction
+    revenue_growth: float | None  # fraction, latest quarter YoY
+    earnings_growth: float | None  # fraction, latest quarter YoY
 
 
 class PriceSummary(BaseModel):
@@ -48,7 +54,7 @@ class PriceSummary(BaseModel):
     week_52_high: float | None
     week_52_low: float | None
     average_volume: int | None
-    dividend_yield: float | None
+    dividend_yield: float | None  # fraction
 
 
 class AnalystSummary(BaseModel):
@@ -67,141 +73,68 @@ class TickerSnapshot(BaseModel):
     analysts: AnalystSummary
 
 
-def _safe(info: dict, key: str, cast=None):
-    """Safely extract a value from yfinance info dict."""
-    val = info.get(key)
-    if val is None:
-        return None
-    if cast:
-        try:
-            return cast(val)
-        except (TypeError, ValueError) as e:
-            logger.error(f"Error casting value {val}: {e}")
-            return None
-    return val
+def _percent_to_fraction(value: float | None) -> float | None:
+    return value / 100 if value is not None else None
 
 
-def get_profile(symbol: str) -> CompanyProfile:
-    """Return basic company profile for a ticker."""
-    info = yf.Ticker(symbol).info
-    return CompanyProfile(
-        symbol=symbol.upper(),
-        name=_safe(info, "longName") or _safe(info, "shortName") or symbol,
-        sector=_safe(info, "sector"),
-        industry=_safe(info, "industry"),
-        market_cap=_safe(info, "marketCap", float),
-        employees=_safe(info, "fullTimeEmployees", int),
-        description=_safe(info, "longBusinessSummary"),
-        website=_safe(info, "website"),
-    )
-
-
-def get_price_summary(symbol: str) -> PriceSummary:
-    """Return current price snapshot for a ticker."""
-    info = yf.Ticker(symbol).info
-    return PriceSummary(
-        symbol=symbol.upper(),
-        current_price=_safe(info, "currentPrice", float),
-        previous_close=_safe(info, "previousClose", float),
-        day_high=_safe(info, "dayHigh", float),
-        day_low=_safe(info, "dayLow", float),
-        week_52_high=_safe(info, "fiftyTwoWeekHigh", float),
-        week_52_low=_safe(info, "fiftyTwoWeekLow", float),
-        average_volume=_safe(info, "averageVolume", int),
-        dividend_yield=_safe(info, "dividendYield", float),
-    )
-
-
-def get_fundamentals(symbol: str) -> Fundamentals:
-    """Return key fundamental ratios for a ticker."""
-    info = yf.Ticker(symbol).info
-    return Fundamentals(
-        symbol=symbol.upper(),
-        pe_ratio=_safe(info, "trailingPE", float),
-        forward_pe=_safe(info, "forwardPE", float),
-        price_to_book=_safe(info, "priceToBook", float),
-        debt_to_equity=_safe(info, "debtToEquity", float),
-        return_on_equity=_safe(info, "returnOnEquity", float),
-        profit_margin=_safe(info, "profitMargins", float),
-        revenue_growth=_safe(info, "revenueGrowth", float),
-        earnings_growth=_safe(info, "earningsGrowth", float),
-        current_ratio=_safe(info, "currentRatio", float),
-        quick_ratio=_safe(info, "quickRatio", float),
-    )
-
-
-def get_analyst_summary(symbol: str) -> AnalystSummary:
-    """Return analyst consensus and price targets."""
-    info = yf.Ticker(symbol).info
-    return AnalystSummary(
-        symbol=symbol.upper(),
-        recommendation=_safe(info, "recommendationKey"),
-        target_mean_price=_safe(info, "targetMeanPrice", float),
-        target_high_price=_safe(info, "targetHighPrice", float),
-        target_low_price=_safe(info, "targetLowPrice", float),
-        number_of_analysts=_safe(info, "numberOfAnalystOpinions", int),
-    )
+def _free_cash_flow_yield(info: dict) -> float | None:
+    fcf, market_cap = info.get("freeCashflow"), info.get("marketCap")
+    return fcf / market_cap if fcf is not None and market_cap else None
 
 
 def get_ticker_snapshot(symbol: str) -> TickerSnapshot:
-    """
-    Single-call convenience: fetch all market data for a ticker.
-    Makes only ONE yfinance request by reusing the Ticker object.
-    """
-    ticker = yf.Ticker(symbol)
-    info = ticker.info
-
-    profile = CompanyProfile(
-        symbol=symbol.upper(),
-        name=_safe(info, "longName") or _safe(info, "shortName") or symbol,
-        sector=_safe(info, "sector"),
-        industry=_safe(info, "industry"),
-        market_cap=_safe(info, "marketCap", float),
-        employees=_safe(info, "fullTimeEmployees", int),
-        description=_safe(info, "longBusinessSummary"),
-        website=_safe(info, "website"),
-    )
-
-    price = PriceSummary(
-        symbol=symbol.upper(),
-        current_price=_safe(info, "currentPrice", float),
-        previous_close=_safe(info, "previousClose", float),
-        day_high=_safe(info, "dayHigh", float),
-        day_low=_safe(info, "dayLow", float),
-        week_52_high=_safe(info, "fiftyTwoWeekHigh", float),
-        week_52_low=_safe(info, "fiftyTwoWeekLow", float),
-        average_volume=_safe(info, "averageVolume", int),
-        dividend_yield=_safe(info, "dividendYield", float),
-    )
-
-    fundamentals = Fundamentals(
-        symbol=symbol.upper(),
-        pe_ratio=_safe(info, "trailingPE", float),
-        forward_pe=_safe(info, "forwardPE", float),
-        price_to_book=_safe(info, "priceToBook", float),
-        debt_to_equity=_safe(info, "debtToEquity", float),
-        return_on_equity=_safe(info, "returnOnEquity", float),
-        profit_margin=_safe(info, "profitMargins", float),
-        revenue_growth=_safe(info, "revenueGrowth", float),
-        earnings_growth=_safe(info, "earningsGrowth", float),
-        current_ratio=_safe(info, "currentRatio", float),
-        quick_ratio=_safe(info, "quickRatio", float),
-    )
-
-    analysts = AnalystSummary(
-        symbol=symbol.upper(),
-        recommendation=_safe(info, "recommendationKey"),
-        target_mean_price=_safe(info, "targetMeanPrice", float),
-        target_high_price=_safe(info, "targetHighPrice", float),
-        target_low_price=_safe(info, "targetLowPrice", float),
-        number_of_analysts=_safe(info, "numberOfAnalystOpinions", int),
-    )
+    """Fetch profile, price, fundamentals and analyst data in one yfinance call."""
+    symbol = symbol.upper()
+    info = yf.Ticker(symbol).info
 
     return TickerSnapshot(
-        profile=profile,
-        price=price,
-        fundamentals=fundamentals,
-        analysts=analysts,
+        profile=CompanyProfile(
+            symbol=symbol,
+            name=info.get("longName") or info.get("shortName") or symbol,
+            sector=info.get("sector"),
+            industry=info.get("industry"),
+            market_cap=info.get("marketCap"),
+            employees=info.get("fullTimeEmployees"),
+            description=info.get("longBusinessSummary"),
+            website=info.get("website"),
+        ),
+        price=PriceSummary(
+            symbol=symbol,
+            current_price=info.get("currentPrice"),
+            previous_close=info.get("previousClose"),
+            day_high=info.get("dayHigh"),
+            day_low=info.get("dayLow"),
+            week_52_high=info.get("fiftyTwoWeekHigh"),
+            week_52_low=info.get("fiftyTwoWeekLow"),
+            average_volume=info.get("averageVolume"),
+            dividend_yield=_percent_to_fraction(info.get("dividendYield")),
+        ),
+        fundamentals=Fundamentals(
+            symbol=symbol,
+            pe_ratio=info.get("trailingPE"),
+            forward_pe=info.get("forwardPE"),
+            peg_ratio=info.get("trailingPegRatio"),
+            price_to_book=info.get("priceToBook"),
+            ev_to_ebitda=info.get("enterpriseToEbitda"),
+            free_cash_flow_yield=_free_cash_flow_yield(info),
+            debt_to_equity=_percent_to_fraction(info.get("debtToEquity")),
+            current_ratio=info.get("currentRatio"),
+            quick_ratio=info.get("quickRatio"),
+            return_on_equity=info.get("returnOnEquity"),
+            return_on_assets=info.get("returnOnAssets"),
+            operating_margin=info.get("operatingMargins"),
+            profit_margin=info.get("profitMargins"),
+            revenue_growth=info.get("revenueGrowth"),
+            earnings_growth=info.get("earningsGrowth"),
+        ),
+        analysts=AnalystSummary(
+            symbol=symbol,
+            recommendation=info.get("recommendationKey"),
+            target_mean_price=info.get("targetMeanPrice"),
+            target_high_price=info.get("targetHighPrice"),
+            target_low_price=info.get("targetLowPrice"),
+            number_of_analysts=info.get("numberOfAnalystOpinions"),
+        ),
     )
 
 

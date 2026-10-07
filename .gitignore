@@ -8,3 +8,4 @@ expts/
 .vscode/
 archive/
 qdrant_storage/
+data/
