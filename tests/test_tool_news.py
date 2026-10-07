@@ -1,55 +1,35 @@
 """
 test_tool_news.py
 -----------------
-Tests src/tools/news.py (RSS feed parser).
+Smoke-tests src/tools/news.py (Yahoo Finance, Google News, Seeking Alpha RSS).
+No API key required.
 Run from project root:
-    uv run python tests/test_tool_news.py
+    uv run python -m tests.test_tool_news [TICKER]
 """
 
-from dotenv import load_dotenv
-load_dotenv()
+import sys
+from datetime import datetime, timedelta, timezone
 
-TICKER = "AAPL"
-
-print(f"\n{'='*60}")
-print(f"  news.py tool — {TICKER}")
-print(f"{'='*60}\n")
-
+from src import config
 from src.tools.news import get_ticker_news
 
-feed = get_ticker_news(TICKER, per_source_limit=3, include_reuters=True)
+TICKER = sys.argv[1] if len(sys.argv) > 1 else "AAPL"
 
-print(f"  Symbol:        {feed.symbol}")
-print(f"  Total Articles: {len(feed.articles)}")
-print(f"  Fetched At:     {feed.fetched_at}")
+print(f"\n== news.py tool - {TICKER} ==\n")
 
-print()
-print(f"  {'─'*56}")
-print(f"  Articles:")
-print(f"  {'─'*56}")
+feed = get_ticker_news(TICKER)
+for a in feed.articles:
+    print(f"  {a.published:%Y-%m-%d} | {a.source:<20.20} | {a.title[:80]}")
+print(f"\n  Failed feeds: {feed.failed_sources or 'none'}\n")
 
-for i, article in enumerate(feed.articles[:5], 1):
-    print(f"\n  [{i}] {article.title[:55]}...")
-    print(f"      Source:     {article.source}")
-    print(f"      Published:  {article.published}")
-    print(f"      URL:        {article.url[:50]}...")
-    if article.summary:
-        summary_preview = article.summary[:60].replace("\n", " ")
-        print(f"      Summary:    {summary_preview}...")
-
-# Quick validation
-none_fields = [
-    k for k, v in {
-        "articles_exist": len(feed.articles) > 0,
-        "fetched_at": feed.fetched_at,
-        "first_article_title": feed.articles[0].title if feed.articles else None,
-        "first_article_source": feed.articles[0].source if feed.articles else None,
-    }.items() if not v
-]
-
-print()
-if none_fields:
-    print(f"  ⚠️   Issues: {none_fields}")
-else:
-    print(f"  ✅  All key fields returned data")
+cutoff = datetime.now(timezone.utc) - timedelta(days=config.NEWS_MAX_AGE_DAYS)
+checks = {
+    "Articles returned": bool(feed.articles),
+    "All feeds succeeded": not feed.failed_sources,
+    "Newest first": all(a.published >= b.published for a, b in zip(feed.articles, feed.articles[1:])),
+    "Within age window": all(a.published >= cutoff for a in feed.articles),
+    "Capped": len(feed.articles) <= config.NEWS_MAX_ARTICLES,
+}
+for label, ok in checks.items():
+    print(f"  [{'PASS' if ok else 'FAIL'}] {label}")
 print()

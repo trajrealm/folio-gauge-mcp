@@ -118,9 +118,13 @@ TECHNICAL_VOLUME_BALANCE_BAND: float = 0.10  # (up - down volume) / total beyond
 TECHNICAL_RSI_BANDS: tuple[float, float] = (70, 30)  # overbought / oversold
 
 # News Analysis
-NEWS_MAX_SUMMARY_CHARS: int = 500
-NEWS_PER_NEWS_SOURCE: int = 5
-NEWS_PER_REUTERS_SOURCE: int = 3
+NEWS_MAX_AGE_DAYS: int = 14
+NEWS_MAX_ARTICLES: int = 25  # newest articles sent to the LLM
+NEWS_SUMMARY_CHARS: int = 300
+NEWS_HIGH_MATERIALITY_WEIGHT: int = 2
+NEWS_NET_BAND: float = 0.15  # net sentiment beyond +/-0.15 -> positive/negative
+NEWS_STRONG_BAND: float = 0.5  # beyond +/-0.5 -> score 5 / 1
+NEWS_FULL_COVERAGE: int = 10  # relevant articles for full coverage
 
 # Peers Analysis
 PEERS_COUNT: int = 5

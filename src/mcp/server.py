@@ -29,7 +29,6 @@ from mcp.server import Server
 from src.agent.graph import run_analysis_with_analysts
 from src.tools.edgar import get_latest_filing_summary
 from src.tools.market import get_ticker_snapshot
-from src.tools.news import get_ticker_news, format_news_for_llm
 from src.orchestrator.aggregator import orchestrate_analysis, format_orchestrator_summary
 from src.orchestrator.evaluator import evaluate_consensus, format_evaluator_decision
 import json

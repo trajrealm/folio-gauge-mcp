@@ -2,129 +2,140 @@
 src/analysts/news.py
 News Analyst Agent
 
-Evaluates sentiment from recent news and company announcements.
-Uses LLM with domain knowledge from skills/news.md and prompts/news.md to guide analysis.
-Returns AgentScore with news sentiment outlook.
+The LLM classifies each recent article (relevance, sentiment, materiality),
+a text task. Code then computes net sentiment, score and confidence from
+those labels, so the score is traceable to the articles behind it.
+Errors propagate to the caller.
 """
 
 from __future__ import annotations
 
-import json
+from typing import Literal
+
 from langchain_openai import ChatOpenAI
-from src.agent.scoring import AgentScore
-from src.agent.knowledge import get_system_message
-from src.tools.news import get_ticker_news
-import traceback
+from pydantic import BaseModel, Field
+
+from src.agent.knowledge import load_prompt
+from src.agent.scoring import AgentScore, compute_confidence, decision_from_score
+from src.tools.news import NewsArticle, get_ticker_news
 
 from .. import config
-from src.utils.logger import get_logger
 
-logger = get_logger(__name__)
+SENTIMENT = {"positive": 1, "neutral": 0, "negative": -1}
 
 
-def _get_llm() -> ChatOpenAI:
-    return ChatOpenAI(model=config.LLM_MODEL_AGENTS, temperature=config.LLM_TEMPERATURE_AGENTS)
+class ArticleLabel(BaseModel):
+    index: int = Field(description="Article number from the list")
+    relevant: bool = Field(description="Primarily about this company")
+    sentiment: Literal["positive", "neutral", "negative"]
+    materiality: Literal["high", "low"]
+
+
+class NewsClassification(BaseModel):
+    articles: list[ArticleLabel]
+    summary: str = Field(description="2-3 sentences on the main catalysts")
+    key_stories: list[str]
+    risk_flags: list[str]
+
+
+def _format_articles(articles: list[NewsArticle]) -> str:
+    lines = []
+    for i, a in enumerate(articles):
+        line = f"[{i}] {a.published:%Y-%m-%d} | {a.source} | {a.title}"
+        lines.append(f"{line} - {a.summary}" if a.summary else line)
+    return "\n".join(lines)
+
+
+def _net(labels: list[ArticleLabel]) -> float | None:
+    """Materiality-weighted (positive - negative) / total, in -1..1."""
+    if not labels:
+        return None
+    weights = [config.NEWS_HIGH_MATERIALITY_WEIGHT if a.materiality == "high" else 1 for a in labels]
+    return sum(w * SENTIMENT[a.sentiment] for w, a in zip(weights, labels)) / sum(weights)
+
+
+def _band(net: float | None) -> int | None:
+    if net is None:
+        return None
+    return 1 if net > config.NEWS_NET_BAND else -1 if net < -config.NEWS_NET_BAND else 0
+
+
+def _score(net: float) -> int:
+    strong, band = config.NEWS_STRONG_BAND, config.NEWS_NET_BAND
+    if net > strong:
+        return 5
+    if net > band:
+        return 4
+    if net < -strong:
+        return 1
+    if net < -band:
+        return 2
+    return 3
+
+
+def _neutral(ticker: str, reasoning: str, data_gaps: list[str]) -> AgentScore:
+    return AgentScore(
+        agent="news",
+        symbol=ticker,
+        decision="HOLD",
+        score=3,
+        timeframe="short",
+        reasoning=reasoning,
+        confidence=0.1,
+        data_gaps=data_gaps,
+    )
 
 
 def analyze_news(ticker: str) -> AgentScore:
     """
-    Analyze recent news sentiment using LLM guided by domain knowledge.
+    Flow:
+      1. Fetch recent articles (tools/news.py)
+      2. LLM labels each article and summarizes the catalysts
+      3. Code computes net sentiment (high materiality counts double) -> score
+      4. Confidence = relevant coverage x agreement of high-materiality and overall direction
     """
+    feed = get_ticker_news(ticker)
+    data_gaps = [f"News feed unavailable: {s}" for s in feed.failed_sources]
+    if not feed.articles:
+        return _neutral(ticker, f"No news in the last {config.NEWS_MAX_AGE_DAYS} days", data_gaps + ["No recent news"])
 
-    data_gaps: list[str] = []
+    llm = ChatOpenAI(model=config.LLM_MODEL_AGENTS, temperature=config.LLM_TEMPERATURE_AGENTS)
+    result: NewsClassification = llm.with_structured_output(NewsClassification).invoke(
+        [
+            {"role": "system", "content": load_prompt("news")},
+            {"role": "user", "content": f"Classify these articles for {ticker}:\n\n{_format_articles(feed.articles)}"},
+        ],
+        config={"run_name": "News Agent"},
+    )
 
-    try:
-        news_items = get_ticker_news(ticker, per_source_limit=10)
+    relevant = [a for a in result.articles if a.relevant and 0 <= a.index < len(feed.articles)]
+    if not relevant:
+        return _neutral(ticker, "No relevant news", data_gaps + ["No relevant news"])
 
-        if not news_items:
-            data_gaps.append("No recent news available")
-            return AgentScore(
-                agent="news",
-                symbol=ticker,
-                decision="HOLD",
-                score=2,
-                timeframe="short",
-                reasoning="Insufficient news data",
-                confidence=0.3,
-                data_gaps=data_gaps,
-            )
+    net = _net(relevant)
+    high = [a for a in relevant if a.materiality == "high"]
+    signals = [s for s in (_band(net), _band(_net(high))) if s is not None]
+    counts = {s: sum(a.sentiment == s for a in relevant) for s in SENTIMENT}
+    facts = (
+        f"{len(relevant)} relevant of {len(feed.articles)} articles "
+        f"({counts['positive']} positive, {counts['neutral']} neutral, {counts['negative']} negative; "
+        f"{len(high)} high materiality); net sentiment {net:+.2f}."
+    )
 
-        news_summary = "\n".join([f"- {item.title}" for item in news_items.articles[:5]])
+    parts = [result.summary, facts]
+    if result.key_stories:
+        parts.append("Key stories: " + "; ".join(result.key_stories) + ".")
+    if result.risk_flags:
+        parts.append("Risks: " + ", ".join(result.risk_flags) + ".")
 
-        news_context = f"""
-Recent News (Last 10 items): {len(news_items.articles)} found
-Recent Headlines:
-{news_summary}
-"""
-
-        system_prompt = get_system_message("news", include_skill=True)
-
-        user_message = f"""Analyze recent news sentiment for {ticker}:
-
-{news_context}
-
-Based on recent news coverage and sentiment, assess the sentiment direction and impact.
-
-Return ONLY a JSON object with this exact structure, no preamble:
-{{
-  "score": <1-5, where 1=very negative news, 3=neutral, 5=very positive news>,
-  "decision": "<BUY|HOLD|SELL>",
-  "confidence": <0.0-1.0>,
-  "reasoning": "<2-3 sentence explanation>",
-  "key_stories": ["<story1>", "<story2>"]
-}}"""
-
-        try:
-            llm = _get_llm()
-            response = llm.invoke([
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ], config={"run_name": "News Agent"})
-
-            result = json.loads(response.content)
-
-            score = max(1.0, min(5.0, float(result.get("score", 3.0))))
-            decision = result.get("decision", "HOLD").upper()
-            confidence = max(0.0, min(1.0, float(result.get("confidence", 0.5))))
-            reasoning = result.get("reasoning", "")
-
-            return AgentScore(
-                agent="news",
-                symbol=ticker,
-                decision=decision,
-                score=int(round(score)),
-                timeframe="short",
-                reasoning=reasoning,
-                confidence=confidence,
-                data_gaps=data_gaps,
-            )
-
-        except json.JSONDecodeError:
-            traceback.print_exc()
-            logger.error(f"News JSON decode error: {response.content}")
-            data_gaps.append("LLM response was not valid JSON")
-            return AgentScore(
-                agent="news",
-                symbol=ticker,
-                decision="HOLD",
-                score=2,
-                timeframe="short",
-                reasoning="LLM analysis failed - invalid response format",
-                confidence=0.2,
-                data_gaps=data_gaps,
-            )
-
-    except Exception as e:
-        traceback.print_exc()
-        logger.error(f"News analysis error: {str(e)}")
-        data_gaps.append(f"News analysis error: {str(e)}")
-        return AgentScore(
-            agent="news",
-            symbol=ticker,
-            decision="HOLD",
-            score=2,
-            timeframe="short",
-            reasoning=f"News analysis failed: {str(e)}",
-            confidence=0.2,
-            data_gaps=data_gaps,
-        )
+    score = _score(net)
+    return AgentScore(
+        agent="news",
+        symbol=ticker,
+        decision=decision_from_score(score),
+        score=score,
+        timeframe="short",
+        reasoning="News: " + " ".join(parts),
+        confidence=compute_confidence(min(1.0, len(relevant) / config.NEWS_FULL_COVERAGE), signals),
+        data_gaps=data_gaps,
+    )
