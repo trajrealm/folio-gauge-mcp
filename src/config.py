@@ -11,36 +11,35 @@ import os
 
 SCORE_MIN: int = 1
 SCORE_MAX: int = 5
-# Each analyst agent scores buy/sell/hold on this scale.
-# 1 = weak signal, 5 = strong signal.
+# Every analyst scores 1-5: 1 = strongly bearish, 3 = neutral, 5 = strongly bullish.
+# decision_from_score maps a (weighted) score to BUY >= 3.5, SELL < 2.5, else HOLD.
 
-VALID_DECISIONS: tuple[str, ...] = ("BUY", "SELL", "HOLD")
-VALID_TIMEFRAMES: tuple[str, ...] = ("short", "mid", "long")
-
-# ---------------------------------------------------------------------------
-# Agent weights for orchestrator aggregation
-# Must sum to 1.0
-# Covers 8 core analysts: technical, fundamentals, sentiment, macro, peers,
-# sector, earnings, news
-# ---------------------------------------------------------------------------
-
+# Per-ticker analyst weights for the consensus; must sum to 1.0.
+# Each analyst's effective weight is this weight x its confidence.
 AGENT_WEIGHTS: dict[str, float] = {
-    "technical":    0.10,
-    "fundamentals": 0.12,
-    "sentiment":    0.09,
-    "macro":        0.08,
-    "peers":        0.06,
-    "sector":       0.09,
-    "earnings":     0.08,
-    "news":         0.08,
-    "discovery":    0.08,
-    "portfolio":    0.14,
+    "fundamentals": 0.17,
+    "earnings": 0.15,
+    "technical": 0.13,
+    "news": 0.12,
+    "peers": 0.12,
+    "sector": 0.11,
+    "sentiment": 0.10,
+    "macro": 0.10,  # lowest: the same backdrop for every stock
 }
 
 # LLM models
-
 LLM_MODEL_AGENTS: str = "gpt-4o-mini"
 LLM_TEMPERATURE_AGENTS: float = 0.3
+LLM_MODEL_EVALUATOR: str = "gpt-4o"
+LLM_TEMPERATURE_EVALUATOR: float = 0.3
+
+# Evaluator: decision gate and risk plan
+EVALUATOR_MIN_CONFIDENCE: float = 0.5  # BUY/SELL below this consensus confidence -> HOLD
+ATR_WINDOW: int = 14
+STOP_ATR_MULTIPLE: float = 2.0  # stop-loss = entry - 2 x ATR
+REWARD_RISK_RATIO: float = 2.0  # take-profit distance = 2 x stop distance
+MAX_POSITION_SIZE: float = 0.10  # of portfolio, scaled by consensus confidence
+STRESSED_VIX_SIZE_CUT: float = 0.3  # size reduced 30% when VIX is above MACRO_VIX_BANDS[1]
 
 # Edgar
 EDGAR_BASE_URL: str = "https://data.sec.gov"

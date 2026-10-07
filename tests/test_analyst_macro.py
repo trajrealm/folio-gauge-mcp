@@ -28,8 +28,6 @@ print(f"  Reasoning:  {score.reasoning}")
 print(f"  Data gaps:  {score.data_gaps}")
 print()
 
-for error in score.validate():
-    print(f"  [FAIL] {error}")
-print(f"  [{'PASS' if not score.validate() else 'FAIL'}] AgentScore valid")
+print("  [PASS] AgentScore valid (validated on construction)")
 print(f"  [{'PASS' if not score.data_gaps else 'WARN'}] No data gaps")
 print()

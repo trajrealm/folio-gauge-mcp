@@ -1,137 +1,109 @@
 """
 agent/graph.py
 --------------
-Wires all nodes into a LangGraph StateGraph.
-The orchestrator calls all 8 core specialist analysts and aggregates their scores.
+Per-ticker pipeline as a LangGraph:
+
+  START -> 8 analyst nodes (run in parallel) -> aggregate -> evaluate -> END
+
+Each analyst node appends one AgentScore to state["scores"]. A failing
+analyst is logged with its stack trace and recorded as a neutral score with
+zero confidence, so it carries no weight in the consensus.
+
+analyze_ticker() is the single entry point.
 """
 
 from __future__ import annotations
 
-from langgraph.graph import StateGraph, START, END
+from typing import Callable
 
-from src.agent.state import AgentState
-from src.orchestrator.aggregator import (
-    orchestrate_analysis,
-    format_orchestrator_summary,
+from langgraph.graph import END, START, StateGraph
+from pydantic import BaseModel
+
+from src.agent.scoring import AgentScore, OrchestratorResult
+from src.agent.state import TickerState
+from src.analysts import (
+    analyze_earnings,
+    analyze_fundamentals,
+    analyze_macro,
+    analyze_news,
+    analyze_peers,
+    analyze_sector,
+    analyze_sentiment,
+    analyze_technical,
 )
-from src.orchestrator.evaluator import evaluate_consensus, format_evaluator_decision
-from src.tools.market import get_ticker_snapshot
+from src.orchestrator.aggregator import aggregate, format_consensus
+from src.orchestrator.evaluator import EvaluatorDecision, evaluate, format_decision
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-def build_analyst_graph() -> StateGraph:
-    """
-    Build analyst pipeline: calls 9 analysts -> orchestrator -> evaluator.
-    Each ticker is analyzed by all 8 core agents, scores are aggregated.
-    """
-    graph = StateGraph(AgentState)
+ANALYSTS: dict[str, Callable[[str], AgentScore]] = {
+    "technical": analyze_technical,
+    "fundamentals": analyze_fundamentals,
+    "sentiment": analyze_sentiment,
+    "macro": analyze_macro,
+    "peers": analyze_peers,
+    "sector": analyze_sector,
+    "earnings": analyze_earnings,
+    "news": analyze_news,
+}
 
-    def orchestrator_node(state: AgentState) -> AgentState:
-        """Call orchestrator for first symbol."""
-        symbols = state.get("symbols", [])
-        if not symbols:
-            return state
 
-        ticker = symbols[0]
-        orchestrator_result = orchestrate_analysis(ticker)
-        orchestrator_summary = format_orchestrator_summary(orchestrator_result)
+class TickerAnalysis(BaseModel):
+    consensus: OrchestratorResult
+    decision: EvaluatorDecision
 
-        state["orchestrator_result"] = orchestrator_result
-        state["orchestrator_summary"] = orchestrator_summary
 
-        state["messages"] = state.get("messages", []) + [
-            {"role": "system", "content": orchestrator_summary}
-        ]
-
-        return state
-
-    def evaluator_node(state: AgentState) -> AgentState:
-        """Call evaluator based on orchestrator result."""
-        orchestrator_result = state.get("orchestrator_result")
-
-        if not orchestrator_result:
-            return state
-
-        ticker = orchestrator_result.ticker
+def _analyst_node(name: str, analyze: Callable[[str], AgentScore]):
+    def node(state: TickerState) -> dict:
+        symbol = state["symbol"]
         try:
-            snapshot = get_ticker_snapshot(ticker)
-            current_price = snapshot.price.current_price
-            if current_price is None:
-                # Fallback if price data unavailable (150.0 is arbitrary placeholder)
-                current_price = 150.0
-                state.setdefault("errors", []).append(
-                    f"Could not fetch price for {ticker}, using placeholder"
-                )
-                logger.warning(f"Could not fetch price for {ticker}, using placeholder")
+            score = analyze(symbol)
         except Exception as e:
-            logger.error(f"Error fetching price for {ticker}: {str(e)}. Default price is being used.")
-            current_price = 150.0
-            state.setdefault("errors", []).append(
-                f"Error fetching price for {ticker}: {str(e)}"
+            logger.exception(f"{name} analyst failed for {symbol}")
+            score = AgentScore(
+                agent=name,
+                symbol=symbol,
+                decision="HOLD",
+                score=3,
+                timeframe="mid",
+                reasoning=f"Analyst failed: {e}",
+                confidence=0.0,
+                data_gaps=[f"Analyst failed: {e}"],
             )
+        return {"scores": [score]}
 
-        portfolio_context = state.get("portfolio_context", {"vix": 15})
-
-        evaluator_decision = evaluate_consensus(
-            orchestrator_result,
-            current_price=current_price,
-            portfolio_context=portfolio_context,
-        )
-
-        evaluator_summary = format_evaluator_decision(evaluator_decision)
-
-        state["evaluator_decision"] = evaluator_decision
-        state["evaluator_summary"] = evaluator_summary
-        state["final_summary"] = (
-            f"{state.get('orchestrator_summary', '')}\n\n{evaluator_summary}"
-        )
-
-        return state
-
-    graph.add_node("orchestrator", orchestrator_node)
-    graph.add_node("evaluator", evaluator_node)
-
-    graph.add_edge(START, "orchestrator")
-    graph.add_edge("orchestrator", "evaluator")
-    graph.add_edge("evaluator", END)
-
-    return graph
+    return node
 
 
-# Compiled analyst graph
-analyst_graph = build_analyst_graph().compile()
+def _aggregate_node(state: TickerState) -> dict:
+    return {"consensus": aggregate(state["symbol"], state["scores"])}
 
-# Public Entry point
-def run_analysis_with_analysts(symbols: list[str]) -> dict:
-    """
-    Run 9-agent analyst pipeline with orchestrator and evaluator.
-    """
-    initial_state: AgentState = {
-        "symbols": [s.upper() for s in symbols],
-        "user_query": f"Analyze {', '.join(symbols)}",
-        "messages": [],
-        "market_data": {},
-        "filing_data": {},
-        "news_data": {},
-        "plan": None,
-        "reflection": None,
-        "needs_more_data": False,
-        "final_summary": None,
-        "errors": [],
-        "orchestrator_result": None,
-        "orchestrator_summary": None,
-        "evaluator_decision": None,
-        "evaluator_summary": None,
-    }
 
-    final_state = analyst_graph.invoke(initial_state)
+def _evaluate_node(state: TickerState) -> dict:
+    return {"decision": evaluate(state["consensus"])}
 
-    return {
-        "symbol": final_state["symbols"][0] if final_state.get("symbols") else None,
-        "orchestrator_result": final_state.get("orchestrator_result"),
-        "evaluator_decision": final_state.get("evaluator_decision"),
-        "orchestrator_summary": final_state.get("orchestrator_summary"),
-        "evaluator_summary": final_state.get("evaluator_summary"),
-        "final_summary": final_state.get("final_summary"),
-    }
+
+def build_graph():
+    graph = StateGraph(TickerState)
+    for name, analyze in ANALYSTS.items():
+        graph.add_node(name, _analyst_node(name, analyze))
+        graph.add_edge(START, name)
+        graph.add_edge(name, "aggregate")
+    graph.add_node("aggregate", _aggregate_node)
+    graph.add_node("evaluate", _evaluate_node)
+    graph.add_edge("aggregate", "evaluate")
+    graph.add_edge("evaluate", END)
+    return graph.compile()
+
+
+ticker_graph = build_graph()
+
+
+def analyze_ticker(symbol: str) -> TickerAnalysis:
+    state = ticker_graph.invoke({"symbol": symbol.upper(), "scores": [], "consensus": None, "decision": None})
+    return TickerAnalysis(consensus=state["consensus"], decision=state["decision"])
+
+
+def format_analysis(analysis: TickerAnalysis) -> str:
+    return f"{format_consensus(analysis.consensus)}\n\n{format_decision(analysis.decision)}"

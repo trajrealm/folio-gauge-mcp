@@ -15,14 +15,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from src.orchestrator.aggregator import orchestrate_analysis  # noqa: E402
+from src.agent.graph import analyze_ticker  # noqa: E402
 from src.portfolio.loader import load_portfolio_csv  # noqa: E402
 from src.portfolio.review import review_portfolio  # noqa: E402
 
 print("\n== portfolio review ==\n")
 
 holdings = load_portfolio_csv("tests/data/sample_portfolio.csv")
-results = {h.symbol: orchestrate_analysis(h.symbol) for h in holdings} if "--analyze" in sys.argv else {}
+results = {h.symbol: analyze_ticker(h.symbol).consensus for h in holdings} if "--analyze" in sys.argv else {}
 report = review_portfolio(holdings, results)
 facts = report.facts
 

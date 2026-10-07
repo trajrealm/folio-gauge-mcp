@@ -21,11 +21,12 @@ from __future__ import annotations
 
 import atexit
 import re
+import threading
 import time
 import uuid
 import warnings
 from functools import lru_cache
-from typing import Literal
+from typing import Callable, Literal, TypeVar
 
 import httpx
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
@@ -329,10 +330,19 @@ def get_latest_filing_summary(
     )
 
 
+T = TypeVar("T")
+
+# Local Qdrant persists to SQLite. The analysts run on LangGraph worker
+# threads, so the connection is shared across threads (check disabled) and
+# every Qdrant call holds this lock: SQLite allows a connection to be used
+# from several threads as long as no two use it at the same time.
+_qdrant_lock = threading.Lock()
+
+
 @lru_cache(maxsize=1)
 def _get_qdrant_client() -> QdrantClient:
-    """Local (on-disk) Qdrant client; the collection is created on first use."""
-    client = QdrantClient(path=config.QDRANT_PATH)
+    """Local (on-disk) Qdrant client; the collection is created on first use. Call via _qdrant."""
+    client = QdrantClient(path=config.QDRANT_PATH, force_disable_check_same_thread=True)
     # Close before interpreter shutdown; closing in __del__ at exit fails.
     atexit.register(client.close)
     if not client.collection_exists(config.EDGAR_QDRANT_COLLECTION):
@@ -392,6 +402,12 @@ def _chunk_text(
     return chunks
 
 
+def _qdrant(operation: Callable[[QdrantClient], T]) -> T:
+    """Run one Qdrant operation under the lock."""
+    with _qdrant_lock:
+        return operation(_get_qdrant_client())
+
+
 def _symbol_filter(symbol: str, **match: str) -> Filter:
     conditions = [FieldCondition(key="symbol", match=MatchValue(value=symbol))]
     conditions += [FieldCondition(key=k, match=MatchValue(value=v)) for k, v in match.items()]
@@ -432,7 +448,6 @@ def ingest_filings(symbol: str) -> int:
     Returns the number of filings in the current set.
     """
     symbol = symbol.upper()
-    client = _get_qdrant_client()
     filings = get_company_filings(symbol)
 
     to_ingest = [
@@ -446,38 +461,39 @@ def ingest_filings(symbol: str) -> int:
     ]
 
     for filing in to_ingest:
-        if _filing_ingested(client, filing):
+        if _qdrant(lambda client: _filing_ingested(client, filing)):
             continue
 
         chunks = _chunk_text(_narrative_text(filing))
         for batch_start in range(0, len(chunks), config.EDGAR_BATCH_SIZE):
             batch = chunks[batch_start : batch_start + config.EDGAR_BATCH_SIZE]
-            client.upsert(
-                collection_name=config.EDGAR_QDRANT_COLLECTION,
-                points=[
-                    PointStruct(
-                        id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{filing.accession_number}/{idx}")),
-                        vector=vector,
-                        payload={
-                            "symbol": symbol,
-                            "filing_type": filing.filing_type,
-                            "filed_date": filing.filed_date,
-                            "accession_number": filing.accession_number,
-                            "chunk_index": idx,
-                            "text": chunk,
-                        },
-                    )
-                    for idx, chunk, vector in zip(
-                        range(batch_start, batch_start + len(batch)), batch, _embed(batch)
-                    )
-                ],
+            points = [
+                PointStruct(
+                    id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{filing.accession_number}/{idx}")),
+                    vector=vector,
+                    payload={
+                        "symbol": symbol,
+                        "filing_type": filing.filing_type,
+                        "filed_date": filing.filed_date,
+                        "accession_number": filing.accession_number,
+                        "chunk_index": idx,
+                        "text": chunk,
+                    },
+                )
+                for idx, chunk, vector in zip(
+                    range(batch_start, batch_start + len(batch)), batch, _embed(batch)
+                )
+            ]
+            _qdrant(
+                lambda client: client.upsert(collection_name=config.EDGAR_QDRANT_COLLECTION, points=points)
             )
         logger.info(
             f"Ingested {symbol} {filing.filing_type} ({filing.filed_date}): {len(chunks)} chunks"
         )
 
     if to_ingest:
-        _prune_stale_filings(client, symbol, [f.accession_number for f in to_ingest])
+        keep = [f.accession_number for f in to_ingest]
+        _qdrant(lambda client: _prune_stale_filings(client, symbol, keep))
 
     return len(to_ingest)
 
@@ -491,12 +507,15 @@ def query_filings(
     symbol = symbol.upper()
     match = {"filing_type": filing_type} if filing_type else {}
 
-    results = _get_qdrant_client().query_points(
-        collection_name=config.EDGAR_QDRANT_COLLECTION,
-        query=_embed([question])[0],
-        query_filter=_symbol_filter(symbol, **match),
-        limit=config.EDGAR_TOP_K_RESULTS,
-        with_payload=True,
+    vector = _embed([question])[0]
+    results = _qdrant(
+        lambda client: client.query_points(
+            collection_name=config.EDGAR_QDRANT_COLLECTION,
+            query=vector,
+            query_filter=_symbol_filter(symbol, **match),
+            limit=config.EDGAR_TOP_K_RESULTS,
+            with_payload=True,
+        )
     )
 
     return FilingQueryResult(

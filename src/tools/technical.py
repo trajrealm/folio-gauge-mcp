@@ -13,6 +13,7 @@ Indicators (None when history is too short):
   - Volume balance: (up-day volume - down-day volume) / total volume over
     the last TECHNICAL_VOLUME_WINDOW days (the normalized OBV change)
   - Relative volume: recent average volume / 3-month average volume
+  - ATR 14: average true range (Wilder smoothing), used for stop-losses
 """
 
 from __future__ import annotations
@@ -42,6 +43,7 @@ class TechnicalSnapshot(BaseModel):
     range_position: float  # 0 = at 52-week low, 1 = at 52-week high
     volume_balance: float | None  # -1 (all selling) to +1 (all buying)
     relative_volume: float | None  # recent / baseline average volume
+    atr_14: float | None  # average true range, price units
 
 
 def _sma(close: pd.Series, window: int) -> float | None:
@@ -67,6 +69,17 @@ def _macd(close: pd.Series) -> tuple[float | None, float | None, float | None]:
     line = fast - slow
     signal = line.ewm(span=config.MACD_SIGNAL_PERIOD, adjust=False).mean()
     return float(line.iloc[-1]), float(signal.iloc[-1]), float(line.iloc[-1] - signal.iloc[-1])
+
+
+def _atr(hist: pd.DataFrame, window: int = config.ATR_WINDOW) -> float | None:
+    """Wilder's average true range: max(high-low, |high-prev close|, |low-prev close|)."""
+    if len(hist) < window + 1:
+        return None
+    prev = hist["Close"].shift()
+    true_range = pd.concat(
+        [hist["High"] - hist["Low"], (hist["High"] - prev).abs(), (hist["Low"] - prev).abs()], axis=1
+    ).max(axis=1)
+    return float(true_range.ewm(alpha=1 / window, adjust=False).mean().iloc[-1])
 
 
 def _return(close: pd.Series, days: int) -> float | None:
@@ -117,4 +130,5 @@ def get_technical_snapshot(symbol: str) -> TechnicalSnapshot | None:
         range_position=(float(close.iloc[-1]) - low) / (high - low) if high > low else 0.5,
         volume_balance=_volume_balance(close, volume),
         relative_volume=_relative_volume(volume),
+        atr_14=_atr(hist),
     )

@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from src.discovery import find_candidates, review_candidates  # noqa: E402
-from src.orchestrator.aggregator import orchestrate_analysis  # noqa: E402
+from src.agent.graph import analyze_ticker  # noqa: E402
 
 print("\n== discovery ==\n")
 
@@ -29,7 +29,7 @@ print(f"  Data gaps: {discovery.data_gaps or 'none'}\n")
 
 results = {}
 if "--analyze" in sys.argv:
-    results = {c.symbol: orchestrate_analysis(c.symbol) for c in discovery.candidates[:2]}
+    results = {c.symbol: analyze_ticker(c.symbol).consensus for c in discovery.candidates[:2]}
 
 review = review_candidates(discovery, results)
 print(f"  Summary: {review.summary}")

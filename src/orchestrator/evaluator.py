@@ -1,334 +1,130 @@
 """
 src/orchestrator/evaluator.py
-Evaluator Agent
+-----------------------------
+Final decision and risk plan for one ticker.
 
-Takes the orchestrator consensus and makes final buy/hold/sell decision.
-Uses domain knowledge from skills/evaluator.md to guide final decision logic.
-Handles trade execution logic (position sizing, stops, targets, risk management).
+In code (thresholds in config):
+  - decision: the consensus decision; BUY/SELL becomes HOLD when consensus
+    confidence is below EVALUATOR_MIN_CONFIDENCE
+  - BUY only: entry = last close; stop = entry - STOP_ATR_MULTIPLE x ATR;
+    take-profit = entry + REWARD_RISK_RATIO x stop distance;
+    size = MAX_POSITION_SIZE x confidence, cut when VIX is stressed
+
+The LLM (LLM_MODEL_EVALUATOR) writes the investment thesis from the
+analysts' reasoning, conflicts and data gaps; it does not change the numbers.
 """
 
 from __future__ import annotations
 
-import json
-from datetime import datetime
-from dataclasses import dataclass
-from typing import Optional
 from langchain_openai import ChatOpenAI
+from pydantic import BaseModel, Field
 
-from src.agent.scoring import OrchestratorResult
-from src.agent.knowledge import get_system_message
-
-from .. import config
-from src.utils.logger import get_logger
-
-logger = get_logger(__name__)
+from src import config
+from src.agent.knowledge import load_prompt
+from src.agent.scoring import Decision, OrchestratorResult
+from src.tools.fred import get_macro_snapshot
+from src.tools.technical import get_technical_snapshot
 
 
-def _get_llm() -> ChatOpenAI:
-    return ChatOpenAI(
-        model=config.LLM_MODEL_AGENTS, temperature=config.LLM_TEMPERATURE_AGENTS
+class Thesis(BaseModel):
+    thesis: str = Field(description="3-5 sentence investment thesis")
+    key_considerations: list[str]
+    risks: list[str]
+
+
+class EvaluatorDecision(BaseModel):
+    symbol: str
+    decision: Decision
+    gated: bool  # consensus BUY/SELL turned into HOLD for low confidence
+    confidence: float  # consensus confidence
+    price: float  # last close
+    atr: float
+    vix: float
+    position_size_pct: float  # of portfolio; 0 unless BUY
+    stop_loss: float | None  # BUY only
+    take_profit: float | None  # BUY only
+    thesis: str
+    key_considerations: list[str]
+    risks: list[str]
+
+
+def _risk_plan(decision: Decision, confidence: float, price: float, atr: float, vix: float) -> dict:
+    if decision != "BUY":
+        return {"position_size_pct": 0.0, "stop_loss": None, "take_profit": None}
+    stop_distance = config.STOP_ATR_MULTIPLE * atr
+    size = config.MAX_POSITION_SIZE * confidence
+    if vix > config.MACRO_VIX_BANDS[1]:
+        size *= 1 - config.STRESSED_VIX_SIZE_CUT
+    return {
+        "position_size_pct": round(size, 4),
+        "stop_loss": round(price - stop_distance, 2),
+        "take_profit": round(price + config.REWARD_RISK_RATIO * stop_distance, 2),
+    }
+
+
+def evaluate(consensus: OrchestratorResult) -> EvaluatorDecision:
+    technical = get_technical_snapshot(consensus.symbol)
+    if technical is None or technical.atr_14 is None:
+        raise ValueError(f"No price history for {consensus.symbol}; cannot build a risk plan")
+    vix = get_macro_snapshot().vix
+
+    gated = consensus.decision != "HOLD" and consensus.confidence < config.EVALUATOR_MIN_CONFIDENCE
+    decision: Decision = "HOLD" if gated else consensus.decision
+    plan = _risk_plan(decision, consensus.confidence, technical.price, technical.atr_14, vix)
+
+    analysts = "\n".join(
+        f"- {s.agent} ({s.decision}, score {s.score}, confidence {s.confidence:.0%}): {s.reasoning}"
+        for s in consensus.agent_scores
     )
-
-
-@dataclass
-class EvaluatorDecision:
-    """
-    Final decision from the evaluator.
-    Includes position sizing, risk management (stops/targets), and execution guidance.
-    """
-
-    ticker: str
-    decision: str
-    position_size_pct: float
-    entry_price: Optional[float] = None
-    stop_loss: Optional[float] = None
-    take_profit: Optional[float] = None
-    stop_loss_pct: float = 0.0
-    take_profit_pct: float = 0.0
-    reasoning: str = ""
-    confidence: float = 0.5
-    risk_level: str = "MEDIUM"
-    timestamp: datetime = None
-
-    def __post_init__(self):
-        if self.timestamp is None:
-            self.timestamp = datetime.utcnow()
-
-
-def evaluate_consensus(
-    result: OrchestratorResult,
-    current_price: float,
-    portfolio_context: Optional[dict] = None,
-) -> EvaluatorDecision:
-
-    portfolio_context = portfolio_context or {}
-
-    try:
-        decision = _evaluate_with_llm(result, current_price, portfolio_context)
-    except Exception as e:
-        logger.error(f"LLM evaluation failed: {str(e)}, falling back to rule-based")
-        decision = _evaluate_fallback(result, current_price, portfolio_context)
-
-    return decision
-
-
-def _evaluate_with_llm(
-    result: OrchestratorResult,
-    current_price: float,
-    portfolio_context: dict,
-) -> EvaluatorDecision:
-
-    vix = portfolio_context.get("vix", 15)
-    portfolio_concentration = portfolio_context.get("top_1_pct", 0.05)
-
-    analyst_summary = "\n".join(
-        [
-            f"  {s.agent}: score={s.score}, decision={s.decision}, confidence={s.confidence:.0%}"
-            for s in sorted(result.agent_scores, key=lambda x: x.score, reverse=True)
-        ]
+    risk_plan = (
+        f"position {plan['position_size_pct']:.1%} of portfolio, stop {plan['stop_loss']}, "
+        f"target {plan['take_profit']}"
+        if decision == "BUY"
+        else "no new position"
     )
+    user_prompt = f"""Write the investment thesis for {consensus.symbol}.
 
-    context = f"""
-Orchestrator Consensus for {result.symbol}:
-Weighted Score: {result.weighted_score:.2f}/5.0
-Decision: {result.decision}
-Confidence: {result.confidence:.0%}
+Consensus: {consensus.decision}, weighted score {consensus.weighted_score:.2f}/5, confidence {consensus.confidence:.0%}, agreement {consensus.agreement:.0%}
+Final decision (facts): {decision}{" (gated from " + consensus.decision + ": confidence below " + f"{config.EVALUATOR_MIN_CONFIDENCE:.0%})" if gated else ""}
+Risk plan (facts): price {technical.price:.2f}, ATR {technical.atr_14:.2f}, VIX {vix:.1f}; {risk_plan}
+Conflicts: {"; ".join(consensus.conflicts) or "none"}
+Data gaps: {"; ".join(consensus.data_gaps) or "none"}
 
-Analyst Breakdown:
-{analyst_summary}
+Analysts:
+{analysts}"""
 
-Current Price: ${current_price:.2f}
-VIX: {vix:.1f}
-Portfolio Concentration: {portfolio_concentration:.1%}
-
-Conflicts: {', '.join(result.conflicts) if result.conflicts else 'None'}
-Dissenting Agents: {', '.join(result.dissenting_agents) if result.dissenting_agents else 'None'}
-"""
-
-    system_prompt = get_system_message("evaluator", include_skill=True)
-
-    user_message = f"""Make a final investment decision for {result.symbol}:
-
-{context}
-
-Based on the orchestrator consensus and market context, decide whether to BUY, HOLD, or SELL with appropriate position sizing and risk management.
-
-Return ONLY a JSON object with this exact structure, no preamble:
-{{
-  "decision": "<BUY|HOLD|SELL>",
-  "position_size_pct": <0.0-0.15, position as % of portfolio>,
-  "stop_loss_pct": <percentage below entry, 0 if not applicable>,
-  "take_profit_pct": <percentage above entry, 0 if not applicable>,
-  "risk_level": "<LOW|MEDIUM|HIGH>",
-  "confidence": <0.5-1.0>,
-  "reasoning": "<2-3 sentence explanation>",
-  "key_considerations": ["<factor1>", "<factor2>"]
-}}"""
-
-    llm = _get_llm()
-    response = llm.invoke(
+    llm = ChatOpenAI(model=config.LLM_MODEL_EVALUATOR, temperature=config.LLM_TEMPERATURE_EVALUATOR)
+    thesis: Thesis = llm.with_structured_output(Thesis).invoke(
         [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
+            {"role": "system", "content": load_prompt("evaluator")},
+            {"role": "user", "content": user_prompt},
         ],
-        config={"run_name": "Evaluator Agent"},
-    )
-
-    llm_result = json.loads(response.content)
-
-    decision_str = llm_result.get("decision", "HOLD").upper()
-    position_size = max(0.0, min(0.15, float(llm_result.get("position_size_pct", 0.0))))
-    stop_loss_pct = max(0.0, float(llm_result.get("stop_loss_pct", 0.0)))
-    take_profit_pct = max(0.0, float(llm_result.get("take_profit_pct", 0.0)))
-    risk_level = llm_result.get("risk_level", "MEDIUM")
-    confidence = max(0.5, min(1.0, float(llm_result.get("confidence", 0.6))))
-    reasoning = llm_result.get("reasoning", "")
-
-    entry_price = current_price if decision_str == "BUY" else None
-    stop_loss = (
-        (current_price * (1 - stop_loss_pct))
-        if (stop_loss_pct > 0 and decision_str == "BUY")
-        else None
-    )
-    take_profit = (
-        (current_price * (1 + take_profit_pct))
-        if (take_profit_pct > 0 and decision_str == "BUY")
-        else None
+        config={"run_name": "Evaluator"},
     )
 
     return EvaluatorDecision(
-        ticker=result.symbol,
-        decision=decision_str,
-        position_size_pct=position_size,
-        entry_price=entry_price,
-        stop_loss=stop_loss,
-        take_profit=take_profit,
-        stop_loss_pct=stop_loss_pct,
-        take_profit_pct=take_profit_pct,
-        reasoning=reasoning,
-        confidence=confidence,
-        risk_level=risk_level,
-    )
-
-
-def _evaluate_fallback(
-    result: OrchestratorResult,
-    current_price: float,
-    portfolio_context: dict,
-) -> EvaluatorDecision:
-
-    vix = portfolio_context.get("vix", 15)
-    portfolio_concentration = portfolio_context.get("top_1_pct", 0.05)
-
-    score = result.weighted_score
-
-    if score >= 4.0:
-        decision = "BUY"
-        confidence = 0.85
-        base_position_size = 0.10
-        risk_level = "MEDIUM"
-        stop_loss_pct = 0.10
-        take_profit_pct = 0.25
-    elif score >= 3.5:
-        decision = "BUY"
-        confidence = 0.75
-        base_position_size = 0.06
-        risk_level = "MEDIUM"
-        stop_loss_pct = 0.12
-        take_profit_pct = 0.20
-    elif score >= 3.0:
-        decision = "HOLD"
-        confidence = 0.60
-        base_position_size = 0.03
-        risk_level = "LOW"
-        stop_loss_pct = 0.15
-        take_profit_pct = 0.15
-    elif score >= 2.5:
-        decision = "HOLD"
-        confidence = 0.55
-        base_position_size = 0.00
-        risk_level = "LOW"
-        stop_loss_pct = 0.20
-        take_profit_pct = 0.10
-    elif score >= 2.0:
-        decision = "SELL"
-        confidence = 0.65
-        base_position_size = 0.00
-        risk_level = "MEDIUM"
-        stop_loss_pct = 0.00
-        take_profit_pct = 0.00
-    else:
-        decision = "SELL"
-        confidence = 0.75
-        base_position_size = 0.00
-        risk_level = "HIGH"
-        stop_loss_pct = 0.00
-        take_profit_pct = 0.00
-
-    if vix > 25:
-        position_size_pct = base_position_size * 0.7
-        risk_level = "HIGH"
-    elif vix < 12:
-        position_size_pct = base_position_size * 1.1
-    else:
-        position_size_pct = base_position_size
-
-    if portfolio_concentration + position_size_pct > 0.15:
-        position_size_pct = max(0, 0.15 - portfolio_concentration)
-        if position_size_pct > 0:
-            risk_level = "MEDIUM"
-
-    entry_price = current_price if decision == "BUY" else None
-    stop_loss = (
-        (entry_price * (1 - stop_loss_pct))
-        if (stop_loss_pct > 0 and decision == "BUY")
-        else None
-    )
-    take_profit = (
-        (entry_price * (1 + take_profit_pct))
-        if (take_profit_pct > 0 and decision == "BUY")
-        else None
-    )
-
-    reasoning_parts = [
-        f"Score: {result.weighted_score:.2f}/5 ({result.decision})",
-        f"Confidence: {result.confidence:.0%}",
-    ]
-
-    if result.conflicts:
-        reasoning_parts.append(f"{len(result.conflicts)} conflicts")
-
-    if result.data_gaps:
-        reasoning_parts.append(f"{len(result.data_gaps)} data gaps")
-
-    reasoning = " | ".join(reasoning_parts)
-
-    return EvaluatorDecision(
-        ticker=result.symbol,
+        symbol=consensus.symbol,
         decision=decision,
-        position_size_pct=position_size_pct,
-        entry_price=entry_price,
-        stop_loss=stop_loss,
-        take_profit=take_profit,
-        stop_loss_pct=stop_loss_pct,
-        take_profit_pct=take_profit_pct,
-        reasoning=reasoning,
-        confidence=confidence,
-        risk_level=risk_level,
+        gated=gated,
+        confidence=consensus.confidence,
+        price=technical.price,
+        atr=technical.atr_14,
+        vix=vix,
+        **plan,
+        thesis=thesis.thesis,
+        key_considerations=thesis.key_considerations,
+        risks=thesis.risks,
     )
 
 
-def format_evaluator_decision(decision: EvaluatorDecision) -> str:
-
-    lines = [
-        f"EVALUATOR DECISION for {decision.ticker}",
-        f"{'='*60}",
-        f"Decision:       {decision.decision}",
-        f"Confidence:     {decision.confidence:.0%}",
-        f"Risk Level:     {decision.risk_level}",
-        "",
-    ]
-
-    if decision.decision == "BUY":
-        lines += [
-            f"Position Size:  {decision.position_size_pct:.1%} of portfolio",
-            (
-                f"Entry:          ${decision.entry_price:.2f}"
-                if decision.entry_price
-                else "Entry: N/A"
-            ),
-            (
-                f"Stop Loss:      ${decision.stop_loss:.2f} ({decision.stop_loss_pct:.1%} below entry)"
-                if decision.stop_loss
-                else "Stop: N/A"
-            ),
-            (
-                f"Take Profit:    ${decision.take_profit:.2f} ({decision.take_profit_pct:.1%} above entry)"
-                if decision.take_profit
-                else "Target: N/A"
-            ),
-            "",
-        ]
-    elif decision.decision == "SELL":
-        lines += [
-            f"Action:         Reduce or exit position",
-            "",
-        ]
-    else:
-        lines += [
-            f"Action:         Hold existing position",
-            "",
-        ]
-
-    lines.append(f"Reasoning:      {decision.reasoning}")
-
+def format_decision(d: EvaluatorDecision) -> str:
+    lines = [f"DECISION for {d.symbol}: {d.decision}" + (" (gated: low confidence)" if d.gated else "")]
+    if d.decision == "BUY":
+        lines.append(
+            f"Position {d.position_size_pct:.1%} of portfolio; entry {d.price:.2f}, "
+            f"stop {d.stop_loss:.2f}, take-profit {d.take_profit:.2f} (ATR {d.atr:.2f}, VIX {d.vix:.1f})"
+        )
+    lines += ["", d.thesis, "", "Key considerations:"]
+    lines += [f"  - {k}" for k in d.key_considerations]
+    lines += ["Risks:"] + [f"  - {r}" for r in d.risks]
     return "\n".join(lines)
-
-
-if __name__ == "__main__":
-    # Test (requires orchestrator result)
-    from src.orchestrator.aggregator import orchestrate_analysis
-
-    result = orchestrate_analysis("AAPL")
-    decision = evaluate_consensus(result, current_price=150.0)
-    print(format_evaluator_decision(decision))
