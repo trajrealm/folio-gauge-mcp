@@ -2,7 +2,7 @@
 src/orchestrator/evaluator.py
 -----------------------------
 Risk plan and investment thesis for one ticker. The decision itself comes
-from the aggregator (horizons combined, confidence gate applied).
+from the aggregator (horizons combined, minimum-confidence check applied).
 
 Risk plan, in code (thresholds in config), BUY only:
   entry = last close
@@ -46,7 +46,7 @@ class EvaluatorDecision(BaseModel):
     symbol: str
     decision: Decision
     setup: Setup
-    gated: bool
+    held_for_low_confidence: bool
     confidence: float
     price: float  # last close
     atr: float
@@ -113,12 +113,15 @@ def evaluate(consensus: OrchestratorResult) -> EvaluatorDecision:
         if consensus.decision == "BUY"
         else ""
     )
-    gate = f" (gated to HOLD from setup {consensus.setup}: leading horizon confidence below {config.HORIZON_MIN_CONFIDENCE:.0%})"
+    held = (
+        f" (held back as HOLD from setup {consensus.setup}: leading horizon confidence "
+        f"{consensus.confidence:.0%} below {config.HORIZON_MIN_CONFIDENCE:.0%})"
+    )
     user_prompt = f"""Write the investment thesis for {consensus.symbol}.
 
 Horizons:
 {horizons}
-Final decision (facts): {consensus.decision}, setup {consensus.setup}{gate if consensus.gated else ""}
+Final decision (facts): {consensus.decision}, setup {consensus.setup}{held if consensus.held_for_low_confidence else ""}
 Risk plan (facts): price {technical.price:.2f}, ATR {technical.atr_14:.2f}, VIX {vix:.1f}; {levels}{plan.note}
 Conflicts: {"; ".join(consensus.conflicts) or "none"}
 Data gaps: {"; ".join(consensus.data_gaps) or "none"}
@@ -139,7 +142,7 @@ Analysts:
         symbol=consensus.symbol,
         decision=consensus.decision,
         setup=consensus.setup,
-        gated=consensus.gated,
+        held_for_low_confidence=consensus.held_for_low_confidence,
         confidence=consensus.confidence,
         price=technical.price,
         atr=technical.atr_14,
@@ -152,7 +155,8 @@ Analysts:
 
 
 def format_decision(d: EvaluatorDecision) -> str:
-    lines = [f"DECISION for {d.symbol}: {d.decision} (setup {d.setup}{', gated: low confidence' if d.gated else ''})"]
+    held = f", {d.setup} held back: low confidence {d.confidence:.0%}" if d.held_for_low_confidence else ""
+    lines = [f"DECISION for {d.symbol}: {d.decision} (setup {d.setup}{held})"]
     if d.decision == "BUY":
         lines.append(
             f"Position {d.plan.position_size_pct:.1%} of portfolio; entry {d.price:.2f}, "

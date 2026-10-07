@@ -45,9 +45,9 @@ Setup = Literal["aligned", "long_term", "accumulate", "trade", "none"]
 
 class OrchestratorResult(BaseModel):
     symbol: str
-    decision: Decision  # final, after combining horizons and the confidence gate
+    decision: Decision  # final, after combining horizons and the minimum-confidence check
     setup: Setup  # how the horizons combined (see aggregator.combine)
-    gated: bool  # BUY/SELL turned into HOLD: the leading horizon's confidence was too low
+    held_for_low_confidence: bool  # BUY/SELL held back as HOLD: the leading horizon's confidence was too low
     confidence: float  # confidence of the horizon leading the decision
     short: HorizonConsensus
     long: HorizonConsensus

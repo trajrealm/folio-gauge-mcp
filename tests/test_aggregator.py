@@ -63,9 +63,9 @@ def test_combine_table(short, long, expected):
 
 def test_accumulate_when_value_meets_downtrend():
     result = aggregate("TEST", _all(short=1, long=4))
-    assert (result.decision, result.setup, result.gated) == ("BUY", "accumulate", False)
+    assert (result.decision, result.setup, result.held_for_low_confidence) == ("BUY", "accumulate", False)
 
 
-def test_gate_on_leading_horizon_confidence():
+def test_held_for_low_leading_horizon_confidence():
     result = aggregate("TEST", _all(short=1, long=4, confidence=0.3))
-    assert (result.decision, result.setup, result.gated) == ("HOLD", "accumulate", True)
+    assert (result.decision, result.setup, result.held_for_low_confidence) == ("HOLD", "accumulate", True)

@@ -32,7 +32,7 @@ c, d = analysis.consensus, analysis.decision
 checks = {
     "All 8 analysts scored": {s.agent for s in c.agent_scores} == set(config.AGENT_WEIGHTS),
     "No analyst failed": not any("Analyst failed" in g for g in c.data_gaps),
-    "Gated means HOLD": not c.gated or c.decision == "HOLD",
+    "Held for low confidence means HOLD": not c.held_for_low_confidence or c.decision == "HOLD",
     "Evaluator keeps the consensus decision": d.decision == c.decision,
     "BUY has stop below and target above price": d.decision != "BUY" or d.plan.stop_loss < d.price < d.plan.take_profit,
     "Thesis written": bool(d.thesis),

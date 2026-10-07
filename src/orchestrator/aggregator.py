@@ -21,7 +21,7 @@ Combined (long horizon leads when the short one is neutral):
   HOLD          BUY trade       HOLD             HOLD
   SELL          BUY trade       SELL long_term   SELL aligned
 
-Gate: BUY/SELL becomes HOLD when the leading horizon (short for "trade",
+Held for low confidence: BUY/SELL becomes HOLD when the leading horizon (short for "trade",
 else long) has confidence below HORIZON_MIN_CONFIDENCE.
 """
 
@@ -82,13 +82,13 @@ def aggregate(symbol: str, scores: list[AgentScore]) -> OrchestratorResult:
     }
     decision, setup, lead = combine(horizons["short"].decision, horizons["long"].decision)
     confidence = horizons[lead].confidence
-    gated = decision != "HOLD" and confidence < config.HORIZON_MIN_CONFIDENCE
+    held = decision != "HOLD" and confidence < config.HORIZON_MIN_CONFIDENCE
 
     return OrchestratorResult(
         symbol=symbol,
-        decision="HOLD" if gated else decision,
+        decision="HOLD" if held else decision,
         setup=setup,
-        gated=gated,
+        held_for_low_confidence=held,
         confidence=confidence,
         short=horizons["short"],
         long=horizons["long"],
@@ -104,8 +104,12 @@ def aggregate(symbol: str, scores: list[AgentScore]) -> OrchestratorResult:
 
 
 def format_consensus(result: OrchestratorResult) -> str:
-    gate = f" (gated from {result.setup}: confidence below {config.HORIZON_MIN_CONFIDENCE:.0%})" if result.gated else ""
-    lines = [f"CONSENSUS for {result.symbol}: {result.decision}, setup {result.setup}{gate}"]
+    held = (
+        f" ({result.setup} held back: confidence {result.confidence:.0%} below {config.HORIZON_MIN_CONFIDENCE:.0%})"
+        if result.held_for_low_confidence
+        else ""
+    )
+    lines = [f"CONSENSUS for {result.symbol}: {result.decision}, setup {result.setup}{held}"]
     for h in (result.short, result.long):
         lines.append(
             f"  {h.horizon:<5} term: {h.decision:<4} score {h.weighted_score:.2f}/5, "
