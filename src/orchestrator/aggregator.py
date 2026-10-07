@@ -14,7 +14,7 @@ The 10 analysts:
     3. sentiment      — Polymarket odds, StockTwits, news
     4. macro          — economic indicators (FRED)
     5. peers          — relative valuation vs peers
-    6. trends         — Reddit mentions, StockTwits trending
+    6. sector         — sector ETF vs market, stock vs sector
     7. earnings       — EPS growth, guidance, beats/misses
     8. news           — article sentiment analysis
   Portfolio agents:
@@ -36,7 +36,7 @@ from src.analysts import (
     analyze_sentiment,
     analyze_macro,
     analyze_peers,
-    analyze_trends,
+    analyze_sector,
     analyze_earnings,
     analyze_news,
     analyze_portfolio,
@@ -66,7 +66,7 @@ def orchestrate_analysis(
         ("sentiment", analyze_sentiment),
         ("macro", analyze_macro),
         ("peers", analyze_peers),
-        ("trends", analyze_trends),
+        ("sector", analyze_sector),
         ("earnings", analyze_earnings),
         ("news", analyze_news),
     ]

@@ -7,7 +7,7 @@ from .fundamentals import analyze_fundamentals
 from .sentiment import analyze_sentiment
 from .macro import analyze_macro
 from .peers import analyze_peers
-from .trends import analyze_trends
+from .sector import analyze_sector
 from .earnings import analyze_earnings
 from .news import analyze_news
 from .discovery import discover_candidates
@@ -19,7 +19,7 @@ __all__ = [
     "analyze_sentiment",
     "analyze_macro",
     "analyze_peers",
-    "analyze_trends",
+    "analyze_sector",
     "analyze_earnings",
     "analyze_news",
     "discover_candidates",

@@ -99,7 +99,7 @@ def get_technical_snapshot(symbol: str) -> TechnicalSnapshot | None:
     close, volume = hist["Close"], hist["Volume"]
     high, low = float(hist["High"].iloc[-252:].max()), float(hist["Low"].iloc[-252:].min())
     macd_value, macd_signal, macd_histogram = _macd(close)
-    returns = {k: _return(close, d) for k, d in config.TECHNICAL_RETURN_WINDOWS.items()}
+    returns = {k: _return(close, d) for k, d in config.RETURN_WINDOWS.items()}
 
     return TechnicalSnapshot(
         symbol=symbol,

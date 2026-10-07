@@ -21,7 +21,7 @@ VALID_TIMEFRAMES: tuple[str, ...] = ("short", "mid", "long")
 # Agent weights for orchestrator aggregation
 # Must sum to 1.0
 # Covers 8 core analysts: technical, fundamentals, sentiment, macro, peers,
-# trends, earnings, news
+# sector, earnings, news
 # ---------------------------------------------------------------------------
 
 AGENT_WEIGHTS: dict[str, float] = {
@@ -30,7 +30,7 @@ AGENT_WEIGHTS: dict[str, float] = {
     "sentiment":    0.09,
     "macro":        0.08,
     "peers":        0.06,
-    "trends":       0.09,
+    "sector":       0.09,
     "earnings":     0.08,
     "news":         0.08,
     "discovery":    0.08,
@@ -79,8 +79,30 @@ FRED_DEFAULT_MULTISERIES_LIMIT: int = 100
 FRED_CPI_LOOKBACK_MONTHS: int = 13
 FRED_GDP_LOOKBACK_QUARTERS: int = 2
 
-# Trends
+# Trends (Reddit / StockTwits attention; used by discovery)
 REDDIT_FILTER: str = "all-stocks"
+
+# Return lookbacks in trading days (technical and sector)
+RETURN_WINDOWS: dict[str, int] = {"return_1m": 21, "return_3m": 63, "return_6m": 126}
+
+# Sector: yfinance sector -> SPDR sector ETF, benchmarked against the market ETF
+SECTOR_ETFS: dict[str, str] = {
+    "Technology": "XLK",
+    "Financial Services": "XLF",
+    "Healthcare": "XLV",
+    "Consumer Cyclical": "XLY",
+    "Consumer Defensive": "XLP",
+    "Communication Services": "XLC",
+    "Industrials": "XLI",
+    "Energy": "XLE",
+    "Basic Materials": "XLB",
+    "Real Estate": "XLRE",
+    "Utilities": "XLU",
+}
+MARKET_ETF: str = "SPY"
+# Excess return beyond +/-band per window votes +1/-1 (sector vs market, stock vs sector).
+# 1m is shown as context only: equal-weighted, a 1m bounce cancelled a 6m trend.
+SECTOR_RELATIVE_BANDS: dict[str, float] = {"return_3m": 0.04, "return_6m": 0.06}
 
 # Technical Analysis (price and volume)
 TECHNICAL_HISTORY_PERIOD: str = "2y"
@@ -88,8 +110,6 @@ RSI_WINDOW: int = 14
 MACD_FAST_EMA_PERIOD: int = 12
 MACD_SLOW_EMA_PERIOD: int = 26
 MACD_SIGNAL_PERIOD: int = 9
-# Trading days per lookback
-TECHNICAL_RETURN_WINDOWS: dict[str, int] = {"return_1m": 21, "return_3m": 63, "return_6m": 126}
 TECHNICAL_VOLUME_WINDOW: int = 20  # volume balance and recent average volume
 TECHNICAL_VOLUME_BASELINE: int = 63  # baseline average volume (3 months)
 # Labels
