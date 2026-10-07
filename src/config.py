@@ -4,9 +4,14 @@ config.py
 Central configuration for folio-gauge.
 All tuneable constants live here — import from this module everywhere else.
 Never hardcode these values in individual files.
+Loads .env here, so every module that imports config sees the environment.
 """
 
 import os
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 SCORE_MIN: int = 1
@@ -202,4 +207,8 @@ PORTFOLIO_EXIT_MIN_CONFIDENCE: float = 0.7  # SELL needs this confidence to "exi
 
 # Discovery: trending candidates from ApeWisdom and StockTwits
 DISCOVERY_POOL: int = 25  # top ApeWisdom tickers and StockTwits trending symbols considered
-DISCOVERY_LIMIT: int = 5
+DISCOVERY_LIMIT: int = 10
+
+# Batch analysis (portfolio review, discovery): tickers analyzed at once.
+# Each ticker already runs 8 analysts in parallel; more would strain the data APIs.
+ANALYSIS_WORKERS: int = 3

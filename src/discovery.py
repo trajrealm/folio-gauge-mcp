@@ -21,6 +21,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from src import config
+from src.agent.graph import analyze_tickers
 from src.agent.knowledge import load_prompt
 from src.agent.scoring import OrchestratorResult
 from src.tools.apewisdom import ApeWisdomMention, fetch_top
@@ -122,4 +123,55 @@ def review_candidates(
             {"role": "user", "content": f"Trending candidates and their analysis:\n\n{lines}"},
         ],
         config={"run_name": "Discovery Review"},
+    )
+
+
+class AnalyzedCandidate(BaseModel):
+    candidate: Candidate
+    decision: str | None  # None when the analysis failed
+    setup: str | None
+    short_score: float | None
+    long_score: float | None
+    confidence: float | None
+    action: str | None  # from the review: research_further / watch / skip
+    reason: str | None
+
+
+class DiscoveryReport(BaseModel):
+    summary: str
+    candidates: list[AnalyzedCandidate]  # best first, per the review
+    failed: dict[str, str]  # symbol -> error (stack trace is logged)
+    data_gaps: list[str]
+
+
+def run_discovery(limit: int = config.DISCOVERY_LIMIT) -> DiscoveryReport:
+    """Find candidates, analyze each with the full pipeline, then review them."""
+    discovery = find_candidates(limit)
+    batch = analyze_tickers([c.symbol for c in discovery.candidates])
+    results = {s: a.consensus for s, a in batch.analyses.items()}
+    review = review_candidates(discovery, results)
+
+    views = {v.symbol: v for v in review.candidates}
+    by_symbol = {c.symbol: c for c in discovery.candidates}
+    order = [v.symbol for v in review.candidates if v.symbol in by_symbol]
+    order += [c.symbol for c in discovery.candidates if c.symbol not in order]
+
+    def analyzed(symbol: str) -> AnalyzedCandidate:
+        r, v = results.get(symbol), views.get(symbol)
+        return AnalyzedCandidate(
+            candidate=by_symbol[symbol],
+            decision=r.decision if r else None,
+            setup=r.setup if r else None,
+            short_score=r.short.weighted_score if r else None,
+            long_score=r.long.weighted_score if r else None,
+            confidence=r.confidence if r else None,
+            action=v.action if v else None,
+            reason=v.reason if v else None,
+        )
+
+    return DiscoveryReport(
+        summary=review.summary,
+        candidates=[analyzed(s) for s in order],
+        failed=batch.failed,
+        data_gaps=discovery.data_gaps,
     )

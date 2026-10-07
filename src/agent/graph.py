@@ -9,16 +9,19 @@ Each analyst node appends one AgentScore to state["scores"]. A failing
 analyst is logged with its stack trace and recorded as a neutral score with
 zero confidence, so it carries no weight in the consensus.
 
-analyze_ticker() is the single entry point.
+analyze_ticker() is the entry point for one ticker; analyze_tickers() runs
+several (config.ANALYSIS_WORKERS at a time) for portfolio review and discovery.
 """
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
+from src import config
 from src.agent.scoring import AgentScore, OrchestratorResult
 from src.agent.state import TickerState
 from src.analysts import (
@@ -103,6 +106,29 @@ ticker_graph = build_graph()
 def analyze_ticker(symbol: str) -> TickerAnalysis:
     state = ticker_graph.invoke({"symbol": symbol.upper(), "scores": [], "consensus": None, "decision": None})
     return TickerAnalysis(consensus=state["consensus"], decision=state["decision"])
+
+
+class BatchAnalysis(BaseModel):
+    analyses: dict[str, TickerAnalysis]
+    failed: dict[str, str]  # symbol -> error message (stack trace is logged)
+
+
+def analyze_tickers(symbols: list[str]) -> BatchAnalysis:
+    """Analyze several tickers; one failing ticker does not stop the others."""
+
+    def run(symbol: str) -> TickerAnalysis | str:
+        try:
+            return analyze_ticker(symbol)
+        except Exception as e:
+            logger.exception(f"Analysis failed for {symbol}")
+            return f"{type(e).__name__}: {e}"
+
+    with ThreadPoolExecutor(config.ANALYSIS_WORKERS) as pool:
+        results = dict(zip(symbols, pool.map(run, symbols)))
+    return BatchAnalysis(
+        analyses={s: r for s, r in results.items() if isinstance(r, TickerAnalysis)},
+        failed={s: r for s, r in results.items() if isinstance(r, str)},
+    )
 
 
 def format_analysis(analysis: TickerAnalysis) -> str:

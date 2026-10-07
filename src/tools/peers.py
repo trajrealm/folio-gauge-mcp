@@ -16,8 +16,10 @@ from __future__ import annotations
 
 from statistics import median
 
+import pandas as pd
 import yfinance as yf
 from pydantic import BaseModel
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from .. import config
 from .market import TickerSnapshot, get_ticker_snapshot
@@ -33,15 +35,33 @@ class PeerComparison(BaseModel):
     premiums: dict[str, float | None]  # valuation only: target / median - 1
 
 
+class YahooDataUnavailable(Exception):
+    """yfinance returned no data (it logs Yahoo errors such as HTTP 401 and returns None)."""
+
+
+@retry(
+    retry=retry_if_exception_type(YahooDataUnavailable),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=8),
+    reraise=True,
+)
+def _top_companies(kind: str, key: str) -> pd.DataFrame:
+    """Top companies of a yfinance Industry or Sector; retried when Yahoo returns nothing."""
+    data = (yf.Industry(key) if kind == "industry" else yf.Sector(key)).top_companies
+    if data is None:
+        raise YahooDataUnavailable(f"No top companies for {kind} '{key}' from Yahoo")
+    return data
+
+
 def find_peers(target: TickerSnapshot, count: int = config.PEERS_COUNT) -> list[str]:
     """Pick peer symbols from the target's industry, filling from its sector."""
     symbol = target.profile.symbol
-    weights = yf.Industry(target.profile.industry_key).top_companies["market weight"]
+    weights = _top_companies("industry", target.profile.industry_key)["market weight"]
     threshold = weights.get(symbol, 0) * config.PEERS_MIN_WEIGHT_RATIO
     peers = [s for s, w in weights.items() if s != symbol and w >= threshold][:count]
 
     if len(peers) < config.PEERS_MIN_INDUSTRY:
-        sector = yf.Sector(target.profile.sector_key).top_companies.index
+        sector = _top_companies("sector", target.profile.sector_key).index
         peers += [s for s in sector if s != symbol and s not in peers][: count - len(peers)]
 
     return peers

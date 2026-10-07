@@ -20,6 +20,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from src import config
+from src.agent.graph import analyze_tickers
 from src.agent.knowledge import load_prompt
 from src.agent.scoring import OrchestratorResult
 from src.portfolio.models import Holding
@@ -74,6 +75,7 @@ class PortfolioReport(BaseModel):
     summary: str
     risks: list[str]
     actions: list[PositionAction]
+    not_analyzed: dict[str, str] = {}  # symbol -> error (stack trace is logged)
 
 
 def compute_facts(holdings: list[Holding]) -> PortfolioFacts:
@@ -193,3 +195,11 @@ def review_portfolio(holdings: list[Holding], results: dict[str, OrchestratorRes
             for symbol, action in actions.items()
         ],
     )
+
+
+def run_portfolio_review(holdings: list[Holding]) -> PortfolioReport:
+    """Analyze every holding with the full pipeline, then review the portfolio."""
+    batch = analyze_tickers([h.symbol for h in holdings])
+    report = review_portfolio(holdings, {s: a.consensus for s, a in batch.analyses.items()})
+    report.not_analyzed = batch.failed
+    return report
