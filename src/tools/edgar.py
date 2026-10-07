@@ -1,58 +1,74 @@
 """
 tools/edgar.py
 --------------
-SEC EDGAR REST API client — no API key required.
-Base URL: https://data.sec.gov
+SEC EDGAR client - no API key required (a contact User-Agent is).
 
 Endpoints used:
-  - /submissions/{cik}.json        → company metadata + filing history
-  - /api/xbrl/companyfacts/{cik}.json → structured financial facts
+  - /files/company_tickers.json            -> ticker to CIK mapping
+  - /submissions/CIK{cik}.json             -> filing history
+  - /api/xbrl/companyfacts/CIK{cik}.json   -> structured financials (XBRL)
+  - Archives/.../{accession}-index.htm     -> filing index (exhibit lookup)
 
-EDGAR rate limit: max 10 req/sec. We stay well below that with tenacity.
+EDGAR rate limit: max 10 req/sec. Requests are spaced 0.15s apart.
 
-Vector DB:
-  - ChromaDB (local, persistent) for storing filing chunks
-  - OpenAI text-embedding-3-small for embeddings
-  - query_filings() is the main entry point for the edgar analyst
+Numbers come from XBRL (get_earnings_facts). Narrative text - MD&A from the
+latest 10-K and 10-Q, and the press release (Exhibit 99.1) of recent
+earnings 8-Ks - is embedded into a local Qdrant index (ingest_filings) and
+searched with query_filings.
 """
 
 from __future__ import annotations
 
-import os
+import atexit
 import re
 import time
+import uuid
+import warnings
+from functools import lru_cache
 from typing import Literal
 
 import httpx
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+from openai import OpenAI
 from pydantic import BaseModel
-from tenacity import retry, stop_after_attempt, wait_exponential
-
 from qdrant_client import QdrantClient
-import hashlib
 from qdrant_client.models import (
-    Filter,
+    Distance,
     FieldCondition,
+    Filter,
+    FilterSelector,
+    MatchAny,
     MatchValue,
     PointStruct,
-    Distance,
     VectorParams,
 )
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
+
 from .. import config
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-HEADERS = {
-    "User-Agent": f"{config.EDGAR_USER_AGENT}",
-    "Accept-Encoding": "gzip, deflate",
-}
 FILING_TYPES = Literal["10-K", "10-Q", "8-K"]
 
+_http = httpx.Client(
+    headers={"User-Agent": config.EDGAR_USER_AGENT, "Accept-Encoding": "gzip, deflate"},
+    timeout=20,
+)
 
-# Vector DB settings
-QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
-QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
+# MD&A start and end headings per filing type.
+_MDNA_PATTERNS = {
+    "10-K": (
+        r"item\s*7\.?\s*management.{0,3}s\s+discussion",
+        r"item\s*7a\.?\s*quantitative",
+    ),
+    "10-Q": (
+        r"item\s*2\.?\s*management.{0,3}s\s+discussion",
+        r"item\s*3\.?\s*quantitative|item\s*4\.?\s*controls",
+    ),
+}
+# A shorter match is a cross-reference (banks often put MD&A in an exhibit).
+_MIN_MDNA_CHARS = 2000
 
 
 class FilingMeta(BaseModel):
@@ -62,8 +78,7 @@ class FilingMeta(BaseModel):
     filed_date: str
     report_date: str | None
     accession_number: str
-    primary_document: str | None
-    description: str | None
+    url: str
 
 
 class FilingSummary(BaseModel):
@@ -82,16 +97,17 @@ class CompanyFilings(BaseModel):
     company_name: str
     recent_10k: FilingMeta | None
     recent_10q: list[FilingMeta]
-    recent_8k: list[FilingMeta]
+    recent_8k: list[FilingMeta]  # earnings releases only (8-K item 2.02)
 
 
-class AllFilingsSummary(BaseModel):
+class EarningsFacts(BaseModel):
+    """XBRL values keyed by metric, then by SEC frame (CY2025 or CY2025Q3)."""
+
     symbol: str
-    cik: str
     company_name: str
-    filing_10k: FilingSummary | None
-    filing_10q: FilingSummary | None
-    filings_8k: list[FilingSummary]
+    is_financial: bool  # bank, broker or insurer: cash flow ratios not meaningful
+    annual: dict[str, dict[str, float]]
+    quarterly: dict[str, dict[str, float]]
 
 
 class FilingQueryResult(BaseModel):
@@ -104,236 +120,237 @@ class FilingQueryResult(BaseModel):
     filed_dates: list[str]
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
+def _is_transient(exc: BaseException) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code == 429 or exc.response.status_code >= 500
+    return isinstance(exc, httpx.TransportError)
+
+
+_retry_transient = retry(
+    retry=retry_if_exception(_is_transient),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=8),
+    reraise=True,
+)
+
+
+@_retry_transient
 def _get(url: str) -> dict:
-    """GET with retry and polite rate limiting."""
-    time.sleep(0.15)  # stay well under 15 req/sec
-    response = httpx.get(url, headers=HEADERS, timeout=15)
+    """GET JSON with retry on transient errors and polite rate limiting."""
+    time.sleep(0.15)
+    response = _http.get(url)
     response.raise_for_status()
     return response.json()
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
+@_retry_transient
 def _get_text(url: str) -> str:
     """GET raw text (for HTML filing docs)."""
     time.sleep(0.15)
-    response = httpx.get(url, headers=HEADERS, timeout=20)
+    response = _http.get(url)
     response.raise_for_status()
     return response.text
 
 
-_cik_cache: dict[str, str] = {}
+@lru_cache(maxsize=1)
+def _ticker_map() -> dict[str, str]:
+    data = _get("https://www.sec.gov/files/company_tickers.json")
+    return {e["ticker"].upper(): str(e["cik_str"]).zfill(10) for e in data.values()}
 
 
 def resolve_cik(symbol: str) -> str:
     """
-    Convert ticker symbol to zero-padded 10-digit CIK.
-    Uses EDGAR's company search endpoint — no key needed.
+    Convert ticker symbol to zero-padded 10-digit CIK using EDGAR's ticker mapping.
     """
-    symbol = symbol.upper()
-    if symbol in _cik_cache:
-        return _cik_cache[symbol]
-
-    url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&company=&CIK={symbol}&type=10-K&dateb=&owner=include&count=5&search_text=&output=atom"
-    time.sleep(0.15)
-    response = httpx.get(url, headers=HEADERS, timeout=15)
-    response.raise_for_status()
-
-    soup = BeautifulSoup(response.text, "xml")
-    company_info = soup.find("company-info")
-    if not company_info:
-        # Fallback: if the search endpoint doesn't return company-info, try the ticker mapping JSON
-        ticker_data = _get("https://www.sec.gov/files/company_tickers.json")
-        for entry in ticker_data.values():
-            if entry.get("ticker", "").upper() == symbol:
-                cik = str(entry["cik_str"]).zfill(10)
-                _cik_cache[symbol] = cik
-                return cik
+    cik = _ticker_map().get(symbol.upper().replace(".", "-"))
+    if cik is None:
         raise ValueError(f"Could not resolve CIK for symbol: {symbol}")
-
-    cik_tag = company_info.find("cik")
-    if not cik_tag:
-        raise ValueError(f"CIK tag not found for symbol: {symbol}")
-
-    cik = cik_tag.text.strip().zfill(10)
-    _cik_cache[symbol] = cik
     return cik
-
-
-def _build_filing_url(
-    cik: str, accession_number: str, primary_doc: str | None
-) -> str | None:
-    if not primary_doc:
-        return None
-    acc_clean = accession_number.replace("-", "")
-    cik_stripped = str(int(cik))
-    return f"https://www.sec.gov/Archives/edgar/data/{cik_stripped}/{acc_clean}/{primary_doc}"
 
 
 def get_company_filings(symbol: str) -> CompanyFilings:
     """
-    Fetch recent 10-K, 10-Q, and 8-K filings for a ticker.
-    Returns structured metadata — does NOT download full text.
+    Fetch recent 10-K, 10-Q, and earnings 8-K filings for a ticker.
+    Returns structured metadata - does NOT download full text.
     """
+    symbol = symbol.upper()
     cik = resolve_cik(symbol)
     data = _get(f"{config.EDGAR_BASE_URL}/submissions/CIK{cik}.json")
-
-    company_name = data.get("name", symbol)
-    recent = data.get("filings", {}).get("recent", {})
-
-    forms = recent.get("form", [])
-    dates = recent.get("filingDate", [])
-    report_dates = recent.get("reportDate", [])
-    accessions = recent.get("accessionNumber", [])
-    descriptions = recent.get("primaryDocument", [])
+    recent = data["filings"]["recent"]
 
     def build_meta(i: int) -> FilingMeta:
-        acc = accessions[i]
-        primary_doc = descriptions[i] if descriptions else None
+        acc = recent["accessionNumber"][i]
         return FilingMeta(
-            symbol=symbol.upper(),
+            symbol=symbol,
             cik=cik,
-            filing_type=forms[i],
-            filed_date=dates[i],
-            report_date=report_dates[i] if report_dates else None,
+            filing_type=recent["form"][i],
+            filed_date=recent["filingDate"][i],
+            report_date=recent["reportDate"][i] or None,
             accession_number=acc,
-            primary_document=_build_filing_url(cik, acc, primary_doc),
-            description=None,
+            url=f"{config.EDGAR_ARCHIVES_URL}/{int(cik)}/{acc.replace('-', '')}/"
+            f"{recent['primaryDocument'][i]}",
         )
 
     recent_10k: FilingMeta | None = None
     recent_10q: list[FilingMeta] = []
     recent_8k: list[FilingMeta] = []
 
-    for i, form in enumerate(forms):
+    for i, form in enumerate(recent["form"]):
         if form == "10-K" and recent_10k is None:
             recent_10k = build_meta(i)
-        elif form == "10-Q" and len(recent_10q) < 4:
+        elif form == "10-Q" and len(recent_10q) < config.EDGAR_RECENT_10Q_COUNT:
             recent_10q.append(build_meta(i))
-        elif form == "8-K" and len(recent_8k) < 5:
+        elif (
+            form == "8-K"
+            and "2.02" in recent["items"][i]
+            and len(recent_8k) < config.EDGAR_RECENT_8K_COUNT
+        ):
             recent_8k.append(build_meta(i))
 
-        # Stop early once we have everything we need
-        if recent_10k and len(recent_10q) >= 4 and len(recent_8k) >= 5:
-            break
-
     return CompanyFilings(
-        symbol=symbol.upper(),
+        symbol=symbol,
         cik=cik,
-        company_name=company_name,
+        company_name=data["name"],
         recent_10k=recent_10k,
         recent_10q=recent_10q,
         recent_8k=recent_8k,
     )
 
 
-def get_filing_text(filing: FilingMeta, max_chars: int = 4000) -> str:
+def get_earnings_facts(symbol: str) -> EarningsFacts:
     """
-    Download and extract plain text from a filing's primary document.
-    Strips HTML tags, collapses whitespace, truncates to max_chars.
-    Pass max_chars=0 for no truncation (used by vector DB ingestion).
+    Fetch annual and quarterly EPS, revenue, net income and operating cash
+    flow from XBRL company facts. SEC frames give one value per period.
+    SIC 6000-6499 (banks, brokers, insurers) marks the company as financial.
+    Foreign filers (IFRS, 20-F) have no us-gaap facts and return empty dicts.
     """
-    if not filing.primary_document:
-        return ""
+    symbol = symbol.upper()
+    cik = resolve_cik(symbol)
+    sic = _get(f"{config.EDGAR_BASE_URL}/submissions/CIK{cik}.json")["sic"]
+    data = _get(f"{config.EDGAR_BASE_URL}/api/xbrl/companyfacts/CIK{cik}.json")
+    gaap = data["facts"].get("us-gaap", {})
 
-    html = _get_text(filing.primary_document)
-    soup = BeautifulSoup(html, "lxml-xml")
+    annual: dict[str, dict[str, float]] = {}
+    quarterly: dict[str, dict[str, float]] = {}
+    for metric, concepts in config.EDGAR_FACT_CONCEPTS.items():
+        candidates = [next(iter(gaap[c]["units"].values())) for c in concepts if c in gaap]
+        if not candidates:
+            continue
+        rows = max(candidates, key=lambda rows: max(r["end"] for r in rows))
+        framed = {r["frame"]: r["val"] for r in rows if "frame" in r}
+        annual[metric] = {f: v for f, v in framed.items() if re.fullmatch(r"CY\d{4}", f)}
+        quarterly[metric] = {f: v for f, v in framed.items() if re.fullmatch(r"CY\d{4}Q\d", f)}
 
-    for tag in soup(["script", "style", "table"]):
-        tag.decompose()
+    return EarningsFacts(
+        symbol=symbol,
+        company_name=data["entityName"],
+        is_financial=sic.isdigit() and 6000 <= int(sic) < 6500,
+        annual=annual,
+        quarterly=quarterly,
+    )
 
-    text = soup.get_text(separator=" ")
 
-    text = re.sub(r"\s+", " ", text).strip()
+def _document_text(url: str) -> str:
+    """
+    Download an HTML filing document and return plain text.
+    Table rows are kept as pipe-delimited text so financial statements survive.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", XMLParsedAsHTMLWarning)
+        soup = BeautifulSoup(_get_text(url), "lxml")
 
-    if max_chars and max_chars > 0:
-        return text[:max_chars]
+    for tag in soup(["script", "style", "ix:header"]):
+        tag.extract()
+
+    for row in reversed(soup.find_all("tr")):
+        cells = [c.get_text(" ", strip=True) for c in row.find_all(["td", "th"])]
+        cells = [c for c in cells if c]
+        row.replace_with(" | ".join(cells) + " ; " if cells else "")
+
+    return re.sub(r"\s+", " ", soup.get_text(separator=" ")).strip()
+
+
+def get_filing_text(filing: FilingMeta, max_chars: int = config.EDGAR_MAX_CHARS) -> str:
+    """
+    Plain text of a filing's primary document, truncated to max_chars.
+    Pass max_chars=0 for no truncation.
+    """
+    text = _document_text(filing.url)
+    return text[:max_chars] if max_chars else text
+
+
+def _mdna_section(text: str, filing_type: str) -> str:
+    """
+    Cut the MD&A section out of 10-K/10-Q text. The last start heading that
+    has an end heading after it is the real one (earlier ones are the table
+    of contents or cross-references). Falls back to the full text.
+    """
+    start_re, end_re = _MDNA_PATTERNS[filing_type]
+    ends = [m.start() for m in re.finditer(end_re, text, re.I)]
+    starts = [m.start() for m in re.finditer(start_re, text, re.I)]
+    starts = [s for s in starts if any(e > s for e in ends)]
+
+    if starts:
+        start = starts[-1]
+        end = next(e for e in ends if e > start)
+        if end - start >= _MIN_MDNA_CHARS:
+            return text[start:end]
+
+    logger.info(f"MD&A section not found in {filing_type}, using full document")
     return text
 
 
+def _exhibit_99_1_url(filing: FilingMeta) -> str | None:
+    """Find the Exhibit 99.1 (press release) document in a filing's index."""
+    index_url = filing.url.rsplit("/", 1)[0] + f"/{filing.accession_number}-index.htm"
+    soup = BeautifulSoup(_get_text(index_url), "lxml")
+    cell = soup.find("td", string="EX-99.1")
+    if cell is None:
+        return None
+    return "https://www.sec.gov" + cell.find_parent("tr").find("a")["href"]
+
+
+def _narrative_text(filing: FilingMeta) -> str:
+    """MD&A for 10-K/10-Q; the earnings press release for 8-K."""
+    if filing.filing_type == "8-K":
+        return _document_text(_exhibit_99_1_url(filing) or filing.url)
+    return _mdna_section(_document_text(filing.url), filing.filing_type)
+
+
 def get_latest_filing_summary(
-    symbol: str, filing_type: config.FILING_TYPES = "10-K"
+    symbol: str, filing_type: FILING_TYPES = "10-K"
 ) -> FilingSummary | None:
     """
     Convenience: get the most recent filing of a given type + a text excerpt.
-    This is the main function the legacy agent will call.
     """
     filings = get_company_filings(symbol)
 
-    filing: FilingMeta | None = None
-    if filing_type == "10-K":
-        filing = filings.recent_10k
-    elif filing_type == "10-Q":
-        filing = filings.recent_10q[0] if filings.recent_10q else None
-    elif filing_type == "8-K":
-        filing = filings.recent_8k[0] if filings.recent_8k else None
-
+    filing = {
+        "10-K": filings.recent_10k,
+        "10-Q": filings.recent_10q[0] if filings.recent_10q else None,
+        "8-K": filings.recent_8k[0] if filings.recent_8k else None,
+    }[filing_type]
     if not filing:
         return None
 
-    excerpt = get_filing_text(filing)
-
     return FilingSummary(
-        symbol=symbol.upper(),
+        symbol=filings.symbol,
         cik=filings.cik,
         company_name=filings.company_name,
         filing_type=filing_type,
         filed_date=filing.filed_date,
         accession_number=filing.accession_number,
-        text_excerpt=excerpt or None,
+        text_excerpt=get_filing_text(filing) or None,
     )
 
 
-def get_all_recent_filings_summary(symbol: str) -> AllFilingsSummary:
-    """
-    Fetch text excerpts for:
-      - Most recent 10-K
-      - Most recent 10-Q
-      - Last 3 8-Ks
-    """
-    filings = get_company_filings(symbol)
-
-    def to_summary(filing: FilingMeta) -> FilingSummary:
-        excerpt = get_filing_text(filing)
-        return FilingSummary(
-            symbol=symbol.upper(),
-            cik=filings.cik,
-            company_name=filings.company_name,
-            filing_type=filing.filing_type,
-            filed_date=filing.filed_date,
-            accession_number=filing.accession_number,
-            text_excerpt=excerpt or None,
-        )
-
-    # 10-K
-    filing_10k = to_summary(filings.recent_10k) if filings.recent_10k else None
-
-    # 10-Q
-    filing_10q = to_summary(filings.recent_10q[0]) if filings.recent_10q else None
-
-    # Last 3 8-Ks
-    filings_8k = [to_summary(f) for f in filings.recent_8k[:3]]
-
-    return AllFilingsSummary(
-        symbol=symbol.upper(),
-        cik=filings.cik,
-        company_name=filings.company_name,
-        filing_10k=filing_10k,
-        filing_10q=filing_10q,
-        filings_8k=filings_8k,
-    )
-
-
-def _get_qdrant_client():
-    """
-    Get a Qdrant client connected to the local self-hosted instance.
-    Creates the collection if it doesn't exist yet.
-    """
-    client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
-
-    # Create collection if it doesn't exist
-    existing = [c.name for c in client.get_collections().collections]
-    if config.EDGAR_QDRANT_COLLECTION not in existing:
+@lru_cache(maxsize=1)
+def _get_qdrant_client() -> QdrantClient:
+    """Local (on-disk) Qdrant client; the collection is created on first use."""
+    client = QdrantClient(path=config.QDRANT_PATH)
+    # Close before interpreter shutdown; closing in __del__ at exit fails.
+    atexit.register(client.close)
+    if not client.collection_exists(config.EDGAR_QDRANT_COLLECTION):
         client.create_collection(
             collection_name=config.EDGAR_QDRANT_COLLECTION,
             vectors_config=VectorParams(
@@ -341,142 +358,143 @@ def _get_qdrant_client():
                 distance=Distance.COSINE,
             ),
         )
-
     return client
 
 
+@lru_cache(maxsize=1)
+def _get_openai_client() -> OpenAI:
+    return OpenAI(max_retries=4)
+
+
 def _embed(texts: list[str]) -> list[list[float]]:
-    """
-    Embed a list of texts using OpenAI text-embedding-3-small.
-    """
-    from openai import OpenAI
-
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-    response = client.embeddings.create(
+    """Embed a list of texts using the configured OpenAI embedding model."""
+    response = _get_openai_client().embeddings.create(
         model=config.EDGAR_EMBEDDING_MODEL,
         input=texts,
     )
-
     return [item.embedding for item in response.data]
 
 
 def _chunk_text(
-    text: str, chunk_size: int = config.EDGAR_CHUNK_SIZE, overlap: int = config.EDGAR_CHUNK_OVERLAP
+    text: str,
+    chunk_size: int = config.EDGAR_CHUNK_SIZE,
+    overlap: int = config.EDGAR_CHUNK_OVERLAP,
 ) -> list[str]:
     """
-    Split text into overlapping chunks.
+    Split text into overlapping chunks, preferring sentence boundaries.
+    Each chunk starts `overlap` characters before the previous chunk ended.
     """
-    if not text:
-        return []
-
     chunks = []
     start = 0
 
     while start < len(text):
         end = start + chunk_size
 
-        # If not at the end, try to break at a sentence boundary
         if end < len(text):
-            # Look for a period/newline within the last 100 chars of the chunk
             boundary = text.rfind(". ", start, end)
-            if boundary != -1 and boundary > start + chunk_size // 2:
-                end = boundary + 1  # include the period
+            if boundary > start + chunk_size // 2:
+                end = boundary + 1
 
         chunk = text[start:end].strip()
         if chunk:
             chunks.append(chunk)
 
-        # Move forward by chunk_size - overlap
-        start += chunk_size - overlap
+        if end >= len(text):
+            break
+
+        start = max(end - overlap, start + 1)
 
     return chunks
 
 
-def ingest_filings(symbol: str) -> dict:
+def _symbol_filter(symbol: str, **match: str) -> Filter:
+    conditions = [FieldCondition(key="symbol", match=MatchValue(value=symbol))]
+    conditions += [FieldCondition(key=k, match=MatchValue(value=v)) for k, v in match.items()]
+    return Filter(must=conditions)
+
+
+def _filing_ingested(client: QdrantClient, filing: FilingMeta) -> bool:
+    points, _ = client.scroll(
+        collection_name=config.EDGAR_QDRANT_COLLECTION,
+        scroll_filter=_symbol_filter(filing.symbol, accession_number=filing.accession_number),
+        limit=1,
+    )
+    return len(points) > 0
+
+
+def _prune_stale_filings(client: QdrantClient, symbol: str, keep_accessions: list[str]) -> None:
+    client.delete(
+        collection_name=config.EDGAR_QDRANT_COLLECTION,
+        points_selector=FilterSelector(
+            filter=Filter(
+                must=[FieldCondition(key="symbol", match=MatchValue(value=symbol))],
+                must_not=[
+                    FieldCondition(key="accession_number", match=MatchAny(any=keep_accessions))
+                ],
+            )
+        ),
+    )
+
+
+def ingest_filings(symbol: str) -> int:
     """
-    Download full text of recent filings for a ticker, chunk them,
-    embed via OpenAI, and store in Qdrant.
+    Embed the narrative of recent filings into Qdrant:
+      - MD&A of the most recent 10-K and 10-Q
+      - press release of the latest earnings 8-Ks (config.EDGAR_NUMBER_8K_IN_SUMMARY)
 
-    Ingests:
-      - Most recent 10-K (full document)
-      - Most recent 10-Q (full document)
-      - Last 3 8-Ks (full documents)
-
-    Points are upserted so re-ingesting the same filing is idempotent.
+    Filings already stored are skipped; stored filings no longer in the
+    current set are removed. Safe to call on every analysis run.
+    Returns the number of filings in the current set.
     """
     symbol = symbol.upper()
     client = _get_qdrant_client()
     filings = get_company_filings(symbol)
 
-    to_ingest: list[FilingMeta] = []
-    if filings.recent_10k:
-        to_ingest.append(filings.recent_10k)
-    if filings.recent_10q:
-        to_ingest.append(filings.recent_10q[0])
-    for f in filings.recent_8k[:3]:
-        to_ingest.append(f)
-
-    counts: dict[str, int] = {}
-    total_chunks = 0
+    to_ingest = [
+        f
+        for f in (
+            filings.recent_10k,
+            filings.recent_10q[0] if filings.recent_10q else None,
+            *filings.recent_8k[: config.EDGAR_NUMBER_8K_IN_SUMMARY],
+        )
+        if f
+    ]
 
     for filing in to_ingest:
-        full_text = get_filing_text(filing, max_chars=0)
-
-        if not full_text:
-            logger.warning(f"No text for {symbol} {filing.filing_type} ({filing.filed_date})")
+        if _filing_ingested(client, filing):
             continue
 
-        chunks = _chunk_text(full_text)
-        if not chunks:
-            continue
-
-        acc_clean = filing.accession_number.replace("-", "")
-
-        batch_size = 100
-        for batch_start in range(0, len(chunks), batch_size):
-            batch_chunks = chunks[batch_start : batch_start + batch_size]
-            embeddings = _embed(batch_chunks)
-
-            points = []
-            for i, (chunk, vector) in enumerate(zip(batch_chunks, embeddings)):
-                chunk_idx = batch_start + i
-
-                # Deterministic integer ID from symbol+accession+chunk_idx
-                id_str = f"{symbol}_{acc_clean}_{chunk_idx}"
-                point_id = int(hashlib.md5(id_str.encode()).hexdigest()[:16], 16) % (
-                    2**63
-                )
-
-                points.append(
+        chunks = _chunk_text(_narrative_text(filing))
+        for batch_start in range(0, len(chunks), config.EDGAR_BATCH_SIZE):
+            batch = chunks[batch_start : batch_start + config.EDGAR_BATCH_SIZE]
+            client.upsert(
+                collection_name=config.EDGAR_QDRANT_COLLECTION,
+                points=[
                     PointStruct(
-                        id=point_id,
+                        id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{filing.accession_number}/{idx}")),
                         vector=vector,
                         payload={
                             "symbol": symbol,
                             "filing_type": filing.filing_type,
                             "filed_date": filing.filed_date,
                             "accession_number": filing.accession_number,
-                            "chunk_index": chunk_idx,
+                            "chunk_index": idx,
                             "text": chunk,
                         },
                     )
-                )
-
-            client.upsert(
-                collection_name=config.EDGAR_QDRANT_COLLECTION,
-                points=points,
+                    for idx, chunk, vector in zip(
+                        range(batch_start, batch_start + len(batch)), batch, _embed(batch)
+                    )
+                ],
             )
-
-        filing_type = filing.filing_type
-        counts[filing_type] = counts.get(filing_type, 0) + len(chunks)
-        total_chunks += len(chunks)
         logger.info(
-            f"Ingested {symbol} {filing_type} ({filing.filed_date}): {len(chunks)} chunks"
+            f"Ingested {symbol} {filing.filing_type} ({filing.filed_date}): {len(chunks)} chunks"
         )
 
-    counts["total"] = total_chunks
-    return counts
+    if to_ingest:
+        _prune_stale_filings(client, symbol, [f.accession_number for f in to_ingest])
+
+    return len(to_ingest)
 
 
 def query_filings(
@@ -485,68 +503,21 @@ def query_filings(
     """
     Query Qdrant for chunks relevant to a question about a ticker's filings.
     """
-
     symbol = symbol.upper()
-    client = _get_qdrant_client()
+    match = {"filing_type": filing_type} if filing_type else {}
 
-    # Embed the question
-    question_vector = _embed([question])[0]
-
-    # Build metadata filter
-    conditions = [FieldCondition(key="symbol", match=MatchValue(value=symbol))]
-    if filing_type:
-        conditions.append(
-            FieldCondition(key="filing_type", match=MatchValue(value=filing_type))
-        )
-
-    results = client.query_points(
+    results = _get_qdrant_client().query_points(
         collection_name=config.EDGAR_QDRANT_COLLECTION,
-        query=question_vector,
-        query_filter=Filter(must=conditions),
+        query=_embed([question])[0],
+        query_filter=_symbol_filter(symbol, **match),
         limit=config.EDGAR_TOP_K_RESULTS,
         with_payload=True,
     )
 
-    documents = [hit.payload["text"] for hit in results.points]
-    filing_types = [hit.payload.get("filing_type", "") for hit in results.points]
-    filed_dates = [hit.payload.get("filed_date", "") for hit in results.points]
-
     return FilingQueryResult(
         symbol=symbol,
         question=question,
-        answer_chunks=documents,
-        filing_types=filing_types,
-        filed_dates=filed_dates,
+        answer_chunks=[hit.payload["text"] for hit in results.points],
+        filing_types=[hit.payload["filing_type"] for hit in results.points],
+        filed_dates=[hit.payload["filed_date"] for hit in results.points],
     )
-
-
-def is_ingested(symbol: str) -> bool:
-    """
-    Check whether a ticker has already been ingested into Qdrant.
-    """
-    try:
-        client = _get_qdrant_client()
-        results = client.scroll(
-            collection_name=config.EDGAR_QDRANT_COLLECTION,
-            scroll_filter=Filter(
-                must=[
-                    FieldCondition(key="symbol", match=MatchValue(value=symbol.upper()))
-                ]
-            ),
-            limit=1,
-        )
-        return len(results[0]) > 0
-    except Exception as e:
-        logger.error(f"Error checking if {symbol} ingested: {e}")
-        return False
-
-
-def ingest_if_needed(symbol: str) -> dict:
-    """
-    Ingest filings only if not already in ChromaDB.
-    Safe to call on every analysis run — skips if already done.
-    """
-    if is_ingested(symbol):
-        logger.info(f"{symbol} already ingested — skipping")
-        return {"skipped": True}
-    return ingest_filings(symbol)

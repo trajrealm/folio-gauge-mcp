@@ -75,7 +75,7 @@ class OrchestratorResult:
     data_gaps: list[str]
 
 
-def _decision_from_score(weighted_score: float) -> str:
+def decision_from_score(weighted_score: float) -> str:
     """
     Map a weighted average score to a BUY / SELL / HOLD decision.
 
@@ -167,7 +167,7 @@ def aggregate_scores(
     weighted_score = weighted_score_sum / total_weight
     weighted_confidence = weighted_confidence_sum / total_weight
 
-    decision = _decision_from_score(weighted_score)
+    decision = decision_from_score(weighted_score)
     timeframe = _majority_timeframe(scores)
     conflicts = _find_conflicts(scores)
     dissenters = _find_dissenters(scores, decision)
@@ -186,39 +186,3 @@ def aggregate_scores(
     )
 
 
-def format_orchestrator_result(result: OrchestratorResult) -> str:
-    """
-    Format an OrchestratorResult as a human-readable string
-    for passing into the final evaluator agent prompt.
-    """
-    lines = [
-        f"Symbol: {result.symbol}",
-        f"Draft Decision: {result.decision}",
-        f"Weighted Score: {result.weighted_score} / {config.SCORE_MAX}",
-        f"Confidence: {result.confidence:.0%}",
-        f"Timeframe: {result.timeframe}",
-        "",
-        "Agent Scores:",
-    ]
-
-    for s in result.agent_scores:
-        lines.append(
-            f"  {s.agent:<15} {s.decision:<4}  score={s.score}  "
-            f"timeframe={s.timeframe}  confidence={s.confidence:.0%}"
-        )
-        lines.append(f"    Reasoning: {s.reasoning}")
-        if s.data_gaps:
-            lines.append(f"    Data gaps: {', '.join(s.data_gaps)}")
-
-    if result.conflicts:
-        lines += ["", "Conflicts detected:"]
-        for c in result.conflicts:
-            lines.append(f"  - {c}")
-
-    if result.dissenting_agents:
-        lines += ["", f"Dissenting agents: {', '.join(result.dissenting_agents)}"]
-
-    if result.data_gaps:
-        lines += ["", f"Overall data gaps: {', '.join(result.data_gaps)}"]
-
-    return "\n".join(lines)

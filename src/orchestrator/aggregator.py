@@ -79,7 +79,7 @@ def orchestrate_analysis(
             score = analyst_func(ticker)
             scores.append(score)
         except Exception as e:
-            logger.error(f"{analyst_name} analyst failed: {str(e)}")
+            logger.exception(f"{analyst_name} analyst failed: {str(e)}")
             scores.append(
                 AgentScore(
                     agent=analyst_name,
@@ -98,7 +98,7 @@ def orchestrate_analysis(
     try:
         result = _aggregate_with_llm(ticker, scores, weights)
     except Exception as e:
-        logger.error(
+        logger.exception(
             f"LLM aggregation failed for {ticker}: {str(e)}, falling back to rule-based"
         )
         result = _aggregate_fallback(ticker, scores, weights)

@@ -2,235 +2,194 @@
 src/analysts/earnings.py
 Earnings Analyst Agent
 
-Analyzes earnings surprises, guidance, and earnings growth using SEC filings.
-Uses RAG (Retrieval-Augmented Generation) to query 10-K and 10-Q filings
-for earnings-specific signals:
-  1. Earnings surprise history
-  2. Earnings growth trends
-  3. Forward guidance and management commentary
-  4. Earnings quality and sustainability
+Combines two SEC sources:
+  1. Numbers from XBRL company facts: annual and quarterly EPS, revenue and
+     net income with YoY growth, plus operating cash flow / net income.
+  2. Narrative via RAG: MD&A of the latest 10-K and 10-Q and recent earnings
+     press releases, for guidance, one-time items and management tone.
 
-Uses skill and prompt from markdown files to guide analysis.
-Returns AgentScore with earnings-based outlook.
+Filings do not contain analyst consensus estimates, so beat/miss versus
+expectations is not assessed. Errors propagate to the caller.
 """
 
 from __future__ import annotations
 
-from src.agent.scoring import AgentScore
-from src.agent.knowledge import load_skill, get_system_message
-from src.tools.edgar import (
-    ingest_if_needed,
-    query_filings,
-    FilingQueryResult,
-)
+from datetime import date
+from typing import Literal
+
 from langchain_openai import ChatOpenAI
+from pydantic import BaseModel, Field
+
+from src.agent.knowledge import load_prompt
+from src.agent.scoring import AgentScore, decision_from_score
+from src.tools.edgar import EarningsFacts, get_earnings_facts, ingest_filings, query_filings
+
 from .. import config
-import json
-from src.utils.logger import get_logger
-import traceback
 
-logger = get_logger(__name__)
-
-
-def _get_llm() -> ChatOpenAI:
-    return ChatOpenAI(model=config.LLM_MODEL_AGENTS, temperature=config.LLM_TEMPERATURE_AGENTS)
-
-
-EARNINGS_QUESTIONS = {
+NARRATIVE_QUESTIONS = {
     "10-K": [
-        "What is the historical earnings per share (EPS) trend over the past 3-5 years?",
-        "How has the company's earnings quality evolved? Are there one-time items or non-recurring charges?",
-        "What is management's outlook on future earnings growth?",
+        "What does management expect for future revenue, margins and earnings, and what will drive them?",
+        "Were there one-time, non-recurring or unusual items affecting reported earnings?",
     ],
     "10-Q": [
-        "Did the company beat or miss earnings estimates in this quarter?",
-        "How did EPS compare to the prior year quarter?",
-        "Did management provide any guidance or commentary on earnings outlook?",
+        "What drove the change in revenue, margins and net income versus the prior-year quarter?",
+        "Were there one-time, non-recurring or unusual items affecting quarterly results?",
+    ],
+    "8-K": [
+        "What guidance or outlook did the company give for the next quarter or fiscal year?",
     ],
 }
 
+QUARTERLY_METRICS = ("eps_diluted", "revenue", "net_income")
 
-def _query_and_format(symbol: str, questions: list[str], filing_type: str) -> str:
+
+class EarningsAnalysis(BaseModel):
+    score: int = Field(ge=1, le=5, description="1=strong bearish, 3=neutral, 5=strong bullish")
+    confidence: float = Field(ge=0.0, le=1.0)
+    eps_trend: Literal["strong", "solid", "flat", "declining"]
+    guidance_signal: Literal["raised", "maintained", "lowered", "withdrawn", "not_stated"]
+    quality_assessment: Literal["high", "medium", "low"]
+    reasoning: str = Field(description="2-3 sentence explanation")
+    key_signals: list[str]
+    risk_flags: list[str]
+
+
+def _fmt(metric: str, value: float) -> str:
+    return f"{value:.2f}" if metric == "eps_diluted" else f"{value / 1e9:,.2f}B"
+
+
+def _prior_year(frame: str) -> str:
+    """CY2025 -> CY2024, CY2025Q3 -> CY2024Q3."""
+    return f"CY{int(frame[2:6]) - 1}{frame[6:]}"
+
+
+def _series_line(metric: str, series: dict[str, float], count: int = 4) -> str:
+    parts = []
+    for frame in sorted(series)[-count:]:
+        part = f"{frame}={_fmt(metric, series[frame])}"
+        prior = series.get(_prior_year(frame))
+        if prior:
+            part += f" ({(series[frame] - prior) / abs(prior):+.0%} YoY)"
+        parts.append(part)
+    return f"  {metric}: " + ", ".join(parts)
+
+
+def _format_financials(facts: EarningsFacts) -> str:
+    annual = facts.annual
+    if facts.is_financial:
+        annual = {m: s for m, s in annual.items() if m != "operating_cash_flow"}
+
+    lines = ["Annual (fiscal years, labelled by nearest calendar year):"]
+    lines += [_series_line(m, s) for m, s in annual.items() if s]
+
+    ocf = annual.get("operating_cash_flow", {})
+    net_income = annual.get("net_income", {})
+    ratios = [
+        f"{f}={ocf[f] / net_income[f]:.2f}"
+        for f in sorted(net_income)[-4:]
+        if f in ocf and net_income[f]
+    ]
+    if ratios:
+        lines.append("  operating_cash_flow / net_income: " + ", ".join(ratios))
+
+    lines.append("Quarterly (labelled by nearest calendar quarter):")
+    lines += [
+        _series_line(m, facts.quarterly[m]) for m in QUARTERLY_METRICS if facts.quarterly.get(m)
+    ]
+    if facts.is_financial:
+        lines.append("Financial company: cash flow is omitted; judge quality from the narrative.")
+    return "\n".join(lines)
+
+
+def _retrieve_narrative(symbol: str) -> dict[str, str]:
     """
-    Query vector DB for earnings-specific questions and format results.
-
-    Args:
-        symbol: Stock ticker
-        questions: List of earnings questions to query
-        filing_type: Filing type filter ("10-K", "10-Q")
+    Query the vector DB per filing type. Chunks already returned for an
+    earlier question are not repeated. Returns {filing_type: section}.
     """
-    sections: list[str] = []
-
-    for question in questions:
-        try:
-            result: FilingQueryResult = query_filings(
-                symbol, question, filing_type=filing_type
-            )
-
-            if not result.answer_chunks:
-                continue
-
-            # Format chunks with their source dates
-            chunks_text = "\n---\n".join(result.answer_chunks)
-            section = f"Q: {question}\nSources: {filing_type} ({', '.join(set(result.filed_dates))})\n{chunks_text}"
-            sections.append(section)
-        except Exception as e:
-            logger.error(f"Error querying filings for {symbol}, question: {question}, filing_type: {filing_type}: {str(e)}")
-
-    return "\n\n".join(sections)
-
-
-def _synthesize_with_llm(symbol: str, context: str) -> dict:
-    """
-    Use LLM to synthesize earnings-specific filing content into a structured analysis.
-    Uses earnings skill and prompt from markdown files to guide analysis.
-    """
-    llm = _get_llm()
-
-    # Load system prompt with embedded skill knowledge
-    system_prompt = get_system_message("earnings", include_skill=True)
-
-    user_prompt = f"""Analyze the following SEC filing excerpts for {symbol}'s earnings performance and outlook.
-
-{context}
-
-Based on these filings, provide your assessment of {symbol}'s earnings quality and growth trajectory.
-
-Return ONLY a valid JSON object with this exact structure, no preamble or markdown:
-{{
-  "decision": "BUY|SELL|HOLD",
-  "score": <1-5>,
-  "confidence": <0.0-1.0>,
-  "eps_trend": "strong|solid|flat|declining",
-  "growth_rate": <float>,
-  "beat_ratio": <0.0-1.0>,
-  "guidance_signal": "raised|maintained|lowered|withdrawn",
-  "quality_assessment": "high|medium|low",
-  "reasoning": "<explanation>",
-  "key_signals": [<list of signals>],
-  "risk_flags": [<list of risks>]
-}}"""
-
-    try:
-        response = llm.invoke([
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ], config={"run_name": "Earnings Agent"})
-
-        if not response.content or not response.content.strip():
-            raise ValueError("Empty LLM response")
-        return json.loads(response.content)
-    except Exception as e:
-        traceback.print_exc()
-        logger.error(f"LLM synthesis error for {symbol}: {str(e)}. Defaulting to HOLD with low confidence.")
-        return {
-            "decision": "HOLD",
-            "score": 3,
-            "confidence": 0.3,
-            "reasoning": f"LLM analysis failed: {str(e)}",
-            "earnings_flags": ["LLM synthesis error"],
-        }
+    sections: dict[str, str] = {}
+    for filing_type, questions in NARRATIVE_QUESTIONS.items():
+        seen: set[str] = set()
+        parts: list[str] = []
+        for question in questions:
+            result = query_filings(symbol, question, filing_type=filing_type)
+            chunks = [c for c in result.answer_chunks if c not in seen]
+            seen.update(chunks)
+            if chunks:
+                dates = ", ".join(sorted(set(result.filed_dates)))
+                parts.append(f"Q: {question}\nSources: {filing_type} ({dates})\n" + "\n---\n".join(chunks))
+        if parts:
+            sections[filing_type] = "\n\n".join(parts)
+    return sections
 
 
 def analyze_earnings(ticker: str) -> AgentScore:
     """
-    Analyze earnings signals from SEC filings using RAG pipeline.
-
     Flow:
-      1. Ingest filings into ChromaDB if not already done
-      2. Query vector DB with earnings-specific questions for 10-K, 10-Q
-      3. LLM synthesizes retrieved chunks into a structured score
-      4. Return AgentScore focused on earnings quality and growth
-
+      1. Fetch XBRL financials and format them with YoY growth
+      2. Ingest new filing narrative into Qdrant and query it
+      3. LLM produces a structured score; decision is derived from the score
     """
     data_gaps: list[str] = []
 
-    try:
-        # Step 1: Ingest filings (skips if already done)
-        try:
-            ingest_result = ingest_if_needed(ticker)
+    facts = get_earnings_facts(ticker)
+    if not facts.annual:
+        data_gaps.append("No US-GAAP XBRL financials (foreign filers report IFRS on 20-F)")
 
-            if ingest_result.get("total", 0) == 0 and not ingest_result.get("skipped"):
-                data_gaps.append("No filing text could be ingested")
-                return AgentScore(
-                    agent="earnings",
-                    symbol=ticker,
-                    decision="HOLD",
-                    score=2,
-                    timeframe="mid",
-                    reasoning="No SEC filing data available for earnings analysis",
-                    confidence=0.2,
-                    data_gaps=data_gaps,
-                )
-        except Exception as e:
-            logger.error(f"Filing ingestion error for {ticker}: {str(e)}")
-            data_gaps.append(f"Filing ingestion error: {str(e)}")
+    ingest_filings(ticker)
+    narrative = _retrieve_narrative(ticker)
+    data_gaps += [f"No {t} narrative retrieved" for t in NARRATIVE_QUESTIONS if t not in narrative]
 
-        # Step 2: Query vector DB for earnings-specific content
-        context_parts: list[str] = []
-
-        for filing_type, questions in EARNINGS_QUESTIONS.items():
-            section = _query_and_format(ticker, questions, filing_type)
-            if section:
-                context_parts.append(f"=== {filing_type} ===\n{section}")
-            else:
-                data_gaps.append(f"No {filing_type} earnings content retrieved")
-
-        if not context_parts:
-            data_gaps.append("Vector DB returned no earnings-specific results")
-            return AgentScore(
-                agent="earnings",
-                symbol=ticker,
-                decision="HOLD",
-                score=2,
-                timeframe="mid",
-                reasoning="SEC filings available but no earnings-specific content extracted",
-                confidence=0.2,
-                data_gaps=data_gaps,
-            )
-
-        full_context = "\n\n".join(context_parts)
-
-        # Step 3: LLM synthesis for earnings signals
-        llm_result = _synthesize_with_llm(ticker, full_context)
-
-        decision = llm_result.get("decision", "HOLD")
-        score = int(llm_result.get("score", 3))
-        confidence = float(llm_result.get("confidence", 0.5))
-        reasoning = llm_result.get("reasoning", "Earnings analysis complete.")
-        earnings_flags = llm_result.get("earnings_flags", [])
-
-        # Clamp score to valid range
-        score = max(1, min(5, score))
-        confidence = max(0.0, min(1.0, confidence))
-
-        # Incorporate earnings flags into reasoning (not data_gaps)
-        # Earnings flags are analyst observations, not missing data
-        if earnings_flags:
-            flag_str = ", ".join(earnings_flags)
-            reasoning = f"{reasoning} Key findings: {flag_str}."
-
-        return AgentScore(
-            agent="earnings",
-            symbol=ticker,
-            decision=decision,
-            score=score,
-            timeframe="mid",  # earnings reflect quarterly/annual outlook
-            reasoning=f"Earnings (RAG): {reasoning}",
-            confidence=confidence,
-            data_gaps=data_gaps,
-        )
-
-    except Exception as e:
-        logger.error(f"Unexpected error in earnings analysis for {ticker}: {str(e)}")
-        data_gaps.append(f"Earnings analysis error: {str(e)}")
+    if not facts.annual and not narrative:
         return AgentScore(
             agent="earnings",
             symbol=ticker,
             decision="HOLD",
-            score=2,
+            score=3,
             timeframe="mid",
-            reasoning=f"Earnings analysis failed: {str(e)}",
-            confidence=0.2,
+            reasoning="No SEC earnings data available",
+            confidence=0.1,
             data_gaps=data_gaps,
         )
+
+    context = []
+    if facts.annual:
+        context.append(f"=== Reported financials (XBRL) ===\n{_format_financials(facts)}")
+    context += [f"=== {t} excerpts ===\n{section}" for t, section in narrative.items()]
+    context_text = "\n\n".join(context)
+
+    user_prompt = f"""Today is {date.today()}. Analyze {ticker}'s earnings performance and outlook from these SEC data.
+All financials are reported actuals, oldest to newest; the last period is the most recent.
+
+{context_text}
+
+Data gaps: {", ".join(data_gaps) or "none"}"""
+
+    llm = ChatOpenAI(model=config.LLM_MODEL_AGENTS, temperature=config.LLM_TEMPERATURE_AGENTS)
+    analysis: EarningsAnalysis = llm.with_structured_output(EarningsAnalysis).invoke(
+        [
+            {"role": "system", "content": load_prompt("earnings")},
+            {"role": "user", "content": user_prompt},
+        ],
+        config={"run_name": "Earnings Agent"},
+    )
+
+    parts = [
+        analysis.reasoning,
+        f"EPS trend: {analysis.eps_trend}; guidance: {analysis.guidance_signal}; "
+        f"earnings quality: {analysis.quality_assessment}.",
+    ]
+    if analysis.key_signals:
+        parts.append("Key signals: " + ", ".join(analysis.key_signals) + ".")
+    if analysis.risk_flags:
+        parts.append("Risks: " + ", ".join(analysis.risk_flags) + ".")
+
+    return AgentScore(
+        agent="earnings",
+        symbol=ticker,
+        decision=decision_from_score(analysis.score),
+        score=analysis.score,
+        timeframe="mid",
+        reasoning="Earnings: " + " ".join(parts),
+        confidence=analysis.confidence,
+        data_gaps=data_gaps,
+    )

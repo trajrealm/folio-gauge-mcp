@@ -6,8 +6,7 @@ All tuneable constants live here — import from this module everywhere else.
 Never hardcode these values in individual files.
 """
 
-# Scoring
-from dotenv.variables import Literal
+import os
 
 
 SCORE_MIN: int = 1
@@ -45,22 +44,34 @@ LLM_MODEL_AGENTS: str = "gpt-4o-mini"
 LLM_TEMPERATURE_AGENTS: float = 0.3
 
 # Edgar
-EDGAR_BASE_URL: str ="https://data.sec.gov"
-EDGAR_SEARCH_URL: str ="https://efts.sec.gov/LATEST/search-index"
-EDGAR_QDRANT_COLLECTION: str ="edgar_filings"
-EDGAR_CHUNK_SIZE: int = 800
-EDGAR_CHUNK_OVERLAP: int = 100
-EDGAR_TOP_K_RESULTS: int = 5
-EDGAR_EMBEDDING_MODEL: str ="text-embedding-3-small"
-EDGAR_EMBEDDING_DIMENSION: int = 1536
-EDGAR_USER_AGENT: str ="folio-gauge-mcp/1.0 contact: example@example.com"
-EDGAR_BATCH_SIZE: int = 100
-EDGAR_MAX_CHARS: int = 4000
-EDGAR_RECENT_10K_FETCH: bool = True
+EDGAR_BASE_URL: str = "https://data.sec.gov"
+EDGAR_ARCHIVES_URL: str = "https://www.sec.gov/Archives/edgar/data"
+EDGAR_USER_AGENT: str = os.getenv("EDGAR_USER_AGENT", "")
 EDGAR_RECENT_10Q_COUNT: int = 4
 EDGAR_RECENT_8K_COUNT: int = 5
 EDGAR_NUMBER_8K_IN_SUMMARY: int = 3
-EDGAR_NUMBER_10Q_IN_SUMMARY: int = 4
+EDGAR_MAX_CHARS: int = 4000
+# XBRL concepts per metric; the first concept with the most recent data wins.
+EDGAR_FACT_CONCEPTS: dict[str, tuple[str, ...]] = {
+    "eps_diluted": ("EarningsPerShareDiluted",),
+    "revenue": (
+        "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "Revenues",
+        "SalesRevenueNet",
+    ),
+    "net_income": ("NetIncomeLoss",),
+    "operating_cash_flow": ("NetCashProvidedByUsedInOperatingActivities",),
+}
+
+# Vector DB (Qdrant local mode, no server needed)
+QDRANT_PATH: str = os.getenv("QDRANT_PATH", "data/qdrant")
+EDGAR_QDRANT_COLLECTION: str = "edgar_filings"
+EDGAR_CHUNK_SIZE: int = 800
+EDGAR_CHUNK_OVERLAP: int = 100
+EDGAR_TOP_K_RESULTS: int = 5
+EDGAR_EMBEDDING_MODEL: str = "text-embedding-3-small"
+EDGAR_EMBEDDING_DIMENSION: int = 1536
+EDGAR_BATCH_SIZE: int = 100
 
 # FRED
 FRED_BASE_URL: str ="https://api.stlouisfed.org/fred"
