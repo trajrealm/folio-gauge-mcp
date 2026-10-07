@@ -18,6 +18,11 @@ def test_weights_cover_exactly_the_analysts():
     assert set(config.AGENT_WEIGHTS) == set(ANALYSTS)
 
 
+def test_horizons_partition_the_analysts():
+    agents = [a for group in config.HORIZONS.values() for a in group]
+    assert sorted(agents) == sorted(ANALYSTS)
+
+
 def test_weights_positive():
     assert all(w > 0 for w in config.AGENT_WEIGHTS.values())
 

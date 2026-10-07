@@ -1,16 +1,19 @@
 """
 src/orchestrator/evaluator.py
 -----------------------------
-Final decision and risk plan for one ticker.
+Risk plan and investment thesis for one ticker. The decision itself comes
+from the aggregator (horizons combined, confidence gate applied).
 
-In code (thresholds in config):
-  - decision: the consensus decision; BUY/SELL becomes HOLD when consensus
-    confidence is below EVALUATOR_MIN_CONFIDENCE
-  - BUY only: entry = last close; stop = entry - STOP_ATR_MULTIPLE x ATR;
-    take-profit = entry + REWARD_RISK_RATIO x stop distance;
-    size = MAX_POSITION_SIZE x confidence, cut when VIX is stressed
+Risk plan, in code (thresholds in config), BUY only:
+  entry = last close
+  size  = MAX_POSITION_SIZE x consensus confidence, cut when VIX is stressed
+  stop  = entry - STOP_ATR_MULTIPLE x ATR; take-profit at REWARD_RISK_RATIO
+  setup "accumulate" (long-term BUY, short-term SELL): a starter position of
+      STARTER_SIZE_FRACTION of the size; add once the short term stabilizes
+  setup "trade" (short-term BUY only): TRADE_SIZE_FRACTION of the size and a
+      tighter stop of TRADE_STOP_ATR_MULTIPLE x ATR
 
-The LLM (LLM_MODEL_EVALUATOR) writes the investment thesis from the
+The LLM (LLM_MODEL_EVALUATOR) writes the thesis from the two horizons, the
 analysts' reasoning, conflicts and data gaps; it does not change the numbers.
 """
 
@@ -21,7 +24,7 @@ from pydantic import BaseModel, Field
 
 from src import config
 from src.agent.knowledge import load_prompt
-from src.agent.scoring import Decision, OrchestratorResult
+from src.agent.scoring import Decision, OrchestratorResult, Setup
 from src.tools.fred import get_macro_snapshot
 from src.tools.technical import get_technical_snapshot
 
@@ -32,34 +35,59 @@ class Thesis(BaseModel):
     risks: list[str]
 
 
+class RiskPlan(BaseModel):
+    position_size_pct: float  # of portfolio; 0 unless BUY
+    stop_loss: float | None
+    take_profit: float | None
+    note: str  # plain-language plan, e.g. that a starter position is intended
+
+
 class EvaluatorDecision(BaseModel):
     symbol: str
     decision: Decision
-    gated: bool  # consensus BUY/SELL turned into HOLD for low confidence
-    confidence: float  # consensus confidence
+    setup: Setup
+    gated: bool
+    confidence: float
     price: float  # last close
     atr: float
     vix: float
-    position_size_pct: float  # of portfolio; 0 unless BUY
-    stop_loss: float | None  # BUY only
-    take_profit: float | None  # BUY only
+    plan: RiskPlan
     thesis: str
     key_considerations: list[str]
     risks: list[str]
 
 
-def _risk_plan(decision: Decision, confidence: float, price: float, atr: float, vix: float) -> dict:
+def _risk_plan(decision: Decision, setup: Setup, confidence: float, price: float, atr: float, vix: float) -> RiskPlan:
     if decision != "BUY":
-        return {"position_size_pct": 0.0, "stop_loss": None, "take_profit": None}
-    stop_distance = config.STOP_ATR_MULTIPLE * atr
+        note = "Reduce or exit the position." if decision == "SELL" else "No new position."
+        return RiskPlan(position_size_pct=0.0, stop_loss=None, take_profit=None, note=note)
+
     size = config.MAX_POSITION_SIZE * confidence
     if vix > config.MACRO_VIX_BANDS[1]:
         size *= 1 - config.STRESSED_VIX_SIZE_CUT
-    return {
-        "position_size_pct": round(size, 4),
-        "stop_loss": round(price - stop_distance, 2),
-        "take_profit": round(price + config.REWARD_RISK_RATIO * stop_distance, 2),
-    }
+    stop_multiple = config.STOP_ATR_MULTIPLE
+    note = "Full position: both horizons support it." if setup == "aligned" else "Full position on the long-term case."
+    if setup == "accumulate":
+        size *= config.STARTER_SIZE_FRACTION
+        note = (
+            f"Starter position only ({config.STARTER_SIZE_FRACTION:.0%} of a full position): the long-term case "
+            "is a BUY but the short-term trend is still negative. Add once the short-term turns."
+        )
+    elif setup == "trade":
+        size *= config.TRADE_SIZE_FRACTION
+        stop_multiple = config.TRADE_STOP_ATR_MULTIPLE
+        note = (
+            f"Short-term trade, not an investment ({config.TRADE_SIZE_FRACTION:.0%} of a full position, "
+            "tighter stop): momentum supports it but the long-term case does not."
+        )
+
+    stop_distance = stop_multiple * atr
+    return RiskPlan(
+        position_size_pct=round(size, 4),
+        stop_loss=round(price - stop_distance, 2),
+        take_profit=round(price + config.REWARD_RISK_RATIO * stop_distance, 2),
+        note=note,
+    )
 
 
 def evaluate(consensus: OrchestratorResult) -> EvaluatorDecision:
@@ -67,26 +95,31 @@ def evaluate(consensus: OrchestratorResult) -> EvaluatorDecision:
     if technical is None or technical.atr_14 is None:
         raise ValueError(f"No price history for {consensus.symbol}; cannot build a risk plan")
     vix = get_macro_snapshot().vix
+    plan = _risk_plan(
+        consensus.decision, consensus.setup, consensus.confidence, technical.price, technical.atr_14, vix
+    )
 
-    gated = consensus.decision != "HOLD" and consensus.confidence < config.EVALUATOR_MIN_CONFIDENCE
-    decision: Decision = "HOLD" if gated else consensus.decision
-    plan = _risk_plan(decision, consensus.confidence, technical.price, technical.atr_14, vix)
-
+    horizons = "\n".join(
+        f"  {h.horizon}-term ({', '.join(config.HORIZONS[h.horizon])}): {h.decision}, "
+        f"score {h.weighted_score:.2f}/5, confidence {h.confidence:.0%}, agreement {h.agreement:.0%}"
+        for h in (consensus.short, consensus.long)
+    )
     analysts = "\n".join(
         f"- {s.agent} ({s.decision}, score {s.score}, confidence {s.confidence:.0%}): {s.reasoning}"
         for s in consensus.agent_scores
     )
-    risk_plan = (
-        f"position {plan['position_size_pct']:.1%} of portfolio, stop {plan['stop_loss']}, "
-        f"target {plan['take_profit']}"
-        if decision == "BUY"
-        else "no new position"
+    levels = (
+        f"size {plan.position_size_pct:.1%} of portfolio, stop {plan.stop_loss}, target {plan.take_profit}; "
+        if consensus.decision == "BUY"
+        else ""
     )
+    gate = f" (gated to HOLD from setup {consensus.setup}: leading horizon confidence below {config.HORIZON_MIN_CONFIDENCE:.0%})"
     user_prompt = f"""Write the investment thesis for {consensus.symbol}.
 
-Consensus: {consensus.decision}, weighted score {consensus.weighted_score:.2f}/5, confidence {consensus.confidence:.0%}, agreement {consensus.agreement:.0%}
-Final decision (facts): {decision}{" (gated from " + consensus.decision + ": confidence below " + f"{config.EVALUATOR_MIN_CONFIDENCE:.0%})" if gated else ""}
-Risk plan (facts): price {technical.price:.2f}, ATR {technical.atr_14:.2f}, VIX {vix:.1f}; {risk_plan}
+Horizons:
+{horizons}
+Final decision (facts): {consensus.decision}, setup {consensus.setup}{gate if consensus.gated else ""}
+Risk plan (facts): price {technical.price:.2f}, ATR {technical.atr_14:.2f}, VIX {vix:.1f}; {levels}{plan.note}
 Conflicts: {"; ".join(consensus.conflicts) or "none"}
 Data gaps: {"; ".join(consensus.data_gaps) or "none"}
 
@@ -104,13 +137,14 @@ Analysts:
 
     return EvaluatorDecision(
         symbol=consensus.symbol,
-        decision=decision,
-        gated=gated,
+        decision=consensus.decision,
+        setup=consensus.setup,
+        gated=consensus.gated,
         confidence=consensus.confidence,
         price=technical.price,
         atr=technical.atr_14,
         vix=vix,
-        **plan,
+        plan=plan,
         thesis=thesis.thesis,
         key_considerations=thesis.key_considerations,
         risks=thesis.risks,
@@ -118,13 +152,13 @@ Analysts:
 
 
 def format_decision(d: EvaluatorDecision) -> str:
-    lines = [f"DECISION for {d.symbol}: {d.decision}" + (" (gated: low confidence)" if d.gated else "")]
+    lines = [f"DECISION for {d.symbol}: {d.decision} (setup {d.setup}{', gated: low confidence' if d.gated else ''})"]
     if d.decision == "BUY":
         lines.append(
-            f"Position {d.position_size_pct:.1%} of portfolio; entry {d.price:.2f}, "
-            f"stop {d.stop_loss:.2f}, take-profit {d.take_profit:.2f} (ATR {d.atr:.2f}, VIX {d.vix:.1f})"
+            f"Position {d.plan.position_size_pct:.1%} of portfolio; entry {d.price:.2f}, "
+            f"stop {d.plan.stop_loss:.2f}, take-profit {d.plan.take_profit:.2f} (ATR {d.atr:.2f}, VIX {d.vix:.1f})"
         )
-    lines += ["", d.thesis, "", "Key considerations:"]
+    lines += [f"Plan: {d.plan.note}", "", d.thesis, "", "Key considerations:"]
     lines += [f"  - {k}" for k in d.key_considerations]
     lines += ["Risks:"] + [f"  - {r}" for r in d.risks]
     return "\n".join(lines)

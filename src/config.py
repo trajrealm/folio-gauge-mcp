@@ -14,8 +14,8 @@ SCORE_MAX: int = 5
 # Every analyst scores 1-5: 1 = strongly bearish, 3 = neutral, 5 = strongly bullish.
 # decision_from_score maps a (weighted) score to BUY >= 3.5, SELL < 2.5, else HOLD.
 
-# Per-ticker analyst weights for the consensus; must sum to 1.0.
-# Each analyst's effective weight is this weight x its confidence.
+# Per-ticker analyst weights; must sum to 1.0. Within each horizon an
+# analyst's effective weight is this weight x its confidence.
 AGENT_WEIGHTS: dict[str, float] = {
     "fundamentals": 0.17,
     "earnings": 0.15,
@@ -27,19 +27,29 @@ AGENT_WEIGHTS: dict[str, float] = {
     "macro": 0.10,  # lowest: the same backdrop for every stock
 }
 
+# The consensus is computed per horizon, then combined (see aggregator.py).
+HORIZONS: dict[str, tuple[str, ...]] = {
+    "short": ("technical", "sentiment", "news", "sector"),  # price and news flow
+    "long": ("fundamentals", "earnings", "peers", "macro"),  # business and valuation
+}
+# BUY/SELL becomes HOLD when the horizon driving the decision has lower confidence.
+HORIZON_MIN_CONFIDENCE: float = 0.4
+
 # LLM models
 LLM_MODEL_AGENTS: str = "gpt-4o-mini"
 LLM_TEMPERATURE_AGENTS: float = 0.3
 LLM_MODEL_EVALUATOR: str = "gpt-4o"
 LLM_TEMPERATURE_EVALUATOR: float = 0.3
 
-# Evaluator: decision gate and risk plan
-EVALUATOR_MIN_CONFIDENCE: float = 0.5  # BUY/SELL below this consensus confidence -> HOLD
+# Evaluator risk plan
 ATR_WINDOW: int = 14
 STOP_ATR_MULTIPLE: float = 2.0  # stop-loss = entry - 2 x ATR
 REWARD_RISK_RATIO: float = 2.0  # take-profit distance = 2 x stop distance
 MAX_POSITION_SIZE: float = 0.10  # of portfolio, scaled by consensus confidence
 STRESSED_VIX_SIZE_CUT: float = 0.3  # size reduced 30% when VIX is above MACRO_VIX_BANDS[1]
+STARTER_SIZE_FRACTION: float = 0.5  # "accumulate": starter position = half the normal size
+TRADE_SIZE_FRACTION: float = 0.5  # "trade": half the normal size
+TRADE_STOP_ATR_MULTIPLE: float = 1.5  # "trade": tighter stop
 
 # Edgar
 EDGAR_BASE_URL: str = "https://data.sec.gov"

@@ -104,7 +104,8 @@ def _format(c: Candidate, result: OrchestratorResult | None) -> str:
         return f"{c.symbol} | {attention} | analysis: not available"
     scores = ", ".join(f"{s.agent} {s.score}" for s in result.agent_scores)
     return (
-        f"{c.symbol} | {attention} | consensus {result.decision}, score {result.weighted_score:.2f}/5, "
+        f"{c.symbol} | {attention} | consensus {result.decision} (setup {result.setup}), "
+        f"short-term {result.short.weighted_score:.2f}/5, long-term {result.long.weighted_score:.2f}/5, "
         f"confidence {result.confidence:.0%} | analysts: {scores}"
     )
 

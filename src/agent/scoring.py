@@ -3,7 +3,8 @@ src/agent/scoring.py
 --------------------
 Shared scoring models and helpers.
   - AgentScore: what every per-ticker analyst returns
-  - OrchestratorResult: the consensus across analysts (built by the aggregator)
+  - HorizonConsensus, OrchestratorResult: the consensus per horizon and combined
+    (built by the aggregator)
   - decision_from_score, compute_confidence
 Field constraints replace manual validation: an invalid score cannot be built.
 """
@@ -31,16 +32,27 @@ class AgentScore(BaseModel):
     data_gaps: list[str] = []
 
 
+class HorizonConsensus(BaseModel):
+    horizon: Literal["short", "long"]
+    decision: Decision  # from the weighted score, before combining or gating
+    weighted_score: float  # confidence-weighted mean of the horizon's analyst scores, 1-5
+    confidence: float  # mean analyst confidence x agreement
+    agreement: float  # 1 = the horizon's analysts give the same score, 0 = maximal spread
+
+
+Setup = Literal["aligned", "long_term", "accumulate", "trade", "none"]
+
+
 class OrchestratorResult(BaseModel):
     symbol: str
-    decision: Decision
-    weighted_score: float  # confidence-weighted mean of analyst scores, 1-5
-    confidence: float  # mean analyst confidence x agreement
-    agreement: float  # 1 = all analysts give the same score, 0 = maximal spread
-    timeframe: Timeframe  # most common analyst timeframe
+    decision: Decision  # final, after combining horizons and the confidence gate
+    setup: Setup  # how the horizons combined (see aggregator.combine)
+    gated: bool  # BUY/SELL turned into HOLD: the leading horizon's confidence was too low
+    confidence: float  # confidence of the horizon leading the decision
+    short: HorizonConsensus
+    long: HorizonConsensus
     agent_scores: list[AgentScore]
     conflicts: list[str]  # analyst pairs with opposing BUY / SELL decisions
-    dissenting_agents: list[str]  # analysts whose decision differs from the consensus
     data_gaps: list[str]  # "agent: gap"
 
 

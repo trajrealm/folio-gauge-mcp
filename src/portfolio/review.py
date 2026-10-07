@@ -147,7 +147,10 @@ def _format(
     for p in facts.positions:
         r = results.get(p.symbol)
         consensus = (
-            f"{r.decision}, score {r.weighted_score:.2f}/5, confidence {r.confidence:.0%}" if r else "not analyzed"
+            f"{r.decision} ({r.setup}), short {r.short.weighted_score:.1f} / long {r.long.weighted_score:.1f}, "
+            f"confidence {r.confidence:.0%}"
+            if r
+            else "not analyzed"
         )
         lines.append(
             f"{p.symbol} | {p.position_type} | {p.sector or 'Unknown'} | {p.weight:.1%} | "
