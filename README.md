@@ -106,8 +106,3 @@ uv run python -m tests.test_portfolio_review [--analyze]
 uv run python -m tests.test_discovery [--analyze]
 uv run python -m tests.test_mcp_server [TICKER] [--full]  # MCP server over stdio
 ```
-
-## Documentation
-
-- `docs/REVIEW_SUMMARY.md`: architecture, design principles, decision rules, known limitations
-- `docs/CHANGELOG.md`: what changed per component and why
