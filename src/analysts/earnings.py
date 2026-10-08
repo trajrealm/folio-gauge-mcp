@@ -17,12 +17,12 @@ from __future__ import annotations
 from datetime import date
 from typing import Literal
 
-from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from src.agent.knowledge import load_prompt
 from src.agent.scoring import AgentScore, compute_confidence, decision_from_score
 from src.tools.edgar import EarningsFacts, get_earnings_facts, ingest_filings, query_filings
+from src.utils.llm import get_llm
 
 from .. import config
 
@@ -218,7 +218,7 @@ All financials are reported actuals, oldest to newest; the last period is the mo
 Computed assessment (facts): {labels_text}
 Data gaps: {", ".join(data_gaps) or "none"}"""
 
-    llm = ChatOpenAI(model=config.LLM_MODEL_AGENTS, temperature=config.LLM_TEMPERATURE_AGENTS)
+    llm = get_llm(config.LLM_MODEL_AGENTS, config.LLM_TEMPERATURE_AGENTS)
     analysis: EarningsAnalysis = llm.with_structured_output(EarningsAnalysis).invoke(
         [
             {"role": "system", "content": load_prompt("earnings")},

@@ -17,7 +17,6 @@ from __future__ import annotations
 from typing import Literal
 
 import yfinance as yf
-from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from src import config
@@ -26,6 +25,7 @@ from src.agent.knowledge import load_prompt
 from src.agent.scoring import OrchestratorResult
 from src.tools.apewisdom import ApeWisdomMention, fetch_top
 from src.tools.stocktwits import StockTwitsTrending, fetch_stocktwits_trending
+from src.utils.llm import get_llm
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -116,7 +116,7 @@ def review_candidates(
 ) -> DiscoveryReview:
     """LLM compares analyzed candidates and recommends which to pursue."""
     lines = "\n".join(_format(c, results.get(c.symbol)) for c in discovery.candidates)
-    llm = ChatOpenAI(model=config.LLM_MODEL_AGENTS, temperature=config.LLM_TEMPERATURE_AGENTS)
+    llm = get_llm(config.LLM_MODEL_AGENTS, config.LLM_TEMPERATURE_AGENTS)
     return llm.with_structured_output(DiscoveryReview).invoke(
         [
             {"role": "system", "content": load_prompt("discovery")},

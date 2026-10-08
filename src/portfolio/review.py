@@ -16,7 +16,6 @@ from __future__ import annotations
 
 from typing import Literal
 
-from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from src import config
@@ -25,6 +24,7 @@ from src.agent.knowledge import load_prompt
 from src.agent.scoring import OrchestratorResult
 from src.portfolio.models import Holding
 from src.tools.market import get_ticker_snapshot
+from src.utils.llm import get_llm
 
 
 class Position(BaseModel):
@@ -176,7 +176,7 @@ def review_portfolio(holdings: list[Holding], results: dict[str, OrchestratorRes
     facts = compute_facts(holdings)
     actions = {p.symbol: position_action(p, results.get(p.symbol)) for p in facts.positions}
 
-    llm = ChatOpenAI(model=config.LLM_MODEL_AGENTS, temperature=config.LLM_TEMPERATURE_AGENTS)
+    llm = get_llm(config.LLM_MODEL_AGENTS, config.LLM_TEMPERATURE_AGENTS)
     review: PortfolioReview = llm.with_structured_output(PortfolioReview).invoke(
         [
             {"role": "system", "content": load_prompt("portfolio")},

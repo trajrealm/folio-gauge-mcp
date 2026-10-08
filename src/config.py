@@ -40,10 +40,13 @@ HORIZONS: dict[str, tuple[str, ...]] = {
 # BUY/SELL becomes HOLD when the horizon driving the decision has lower confidence.
 HORIZON_MIN_CONFIDENCE: float = 0.4
 
-# LLM models
-LLM_MODEL_AGENTS: str = "gpt-4o-mini"
+# LLM provider: any OpenAI-compatible API, set in .env. LLM_BASE_URL unset = OpenAI.
+# e.g. OpenRouter https://openrouter.ai/api/v1, Cerebras https://api.cerebras.ai/v1
+LLM_BASE_URL: str | None = os.getenv("LLM_BASE_URL") or None
+LLM_API_KEY: str | None = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
+LLM_MODEL_AGENTS: str = os.getenv("LLM_MODEL_AGENTS", "gpt-4o-mini")
 LLM_TEMPERATURE_AGENTS: float = 0.3
-LLM_MODEL_EVALUATOR: str = "gpt-4o"
+LLM_MODEL_EVALUATOR: str = os.getenv("LLM_MODEL_EVALUATOR", "gpt-4o")
 LLM_TEMPERATURE_EVALUATOR: float = 0.3
 
 # Evaluator risk plan
@@ -78,12 +81,18 @@ EDGAR_FACT_CONCEPTS: dict[str, tuple[str, ...]] = {
 
 # Vector DB (Qdrant local mode, no server needed)
 QDRANT_PATH: str = os.getenv("QDRANT_PATH", "data/qdrant")
-EDGAR_QDRANT_COLLECTION: str = "edgar_filings"
 EDGAR_CHUNK_SIZE: int = 800
 EDGAR_CHUNK_OVERLAP: int = 100
 EDGAR_TOP_K_RESULTS: int = 5
-EDGAR_EMBEDDING_MODEL: str = "text-embedding-3-small"
-EDGAR_EMBEDDING_DIMENSION: int = 1536
+# Embeddings: any OpenAI-compatible provider, set in .env; defaults to the LLM provider.
+# OpenRouter prefixes model names: openai/text-embedding-3-small. Cerebras has no embeddings.
+EMBEDDING_BASE_URL: str | None = os.getenv("EMBEDDING_BASE_URL") or LLM_BASE_URL
+EMBEDDING_API_KEY: str | None = os.getenv("EMBEDDING_API_KEY") or LLM_API_KEY
+EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+EMBEDDING_DIMENSION: int = int(os.getenv("EMBEDDING_DIMENSION", "1536"))
+# One collection per embedding model (provider prefix dropped): vectors from
+# different models are not comparable.
+EDGAR_QDRANT_COLLECTION: str = "edgar_filings_" + EMBEDDING_MODEL.split("/")[-1]
 EDGAR_BATCH_SIZE: int = 100
 
 # FRED (macro). Each series is fetched once per day; 2 years of history.

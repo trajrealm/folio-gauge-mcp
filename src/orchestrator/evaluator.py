@@ -19,7 +19,6 @@ analysts' reasoning, conflicts and data gaps; it does not change the numbers.
 
 from __future__ import annotations
 
-from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from src import config
@@ -27,6 +26,7 @@ from src.agent.knowledge import load_prompt
 from src.agent.scoring import Decision, OrchestratorResult, Setup
 from src.tools.fred import get_macro_snapshot
 from src.tools.technical import get_technical_snapshot
+from src.utils.llm import get_llm
 
 
 class Thesis(BaseModel):
@@ -129,7 +129,7 @@ Data gaps: {"; ".join(consensus.data_gaps) or "none"}
 Analysts:
 {analysts}"""
 
-    llm = ChatOpenAI(model=config.LLM_MODEL_EVALUATOR, temperature=config.LLM_TEMPERATURE_EVALUATOR)
+    llm = get_llm(config.LLM_MODEL_EVALUATOR, config.LLM_TEMPERATURE_EVALUATOR)
     thesis: Thesis = llm.with_structured_output(Thesis).invoke(
         [
             {"role": "system", "content": load_prompt("evaluator")},

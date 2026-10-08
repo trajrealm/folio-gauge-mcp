@@ -15,7 +15,10 @@ cp .env.example .env    # then fill in the keys below
 
 | Variable | Purpose |
 |---|---|
-| `OPENAI_API_KEY` | gpt-4o-mini (analysts) and gpt-4o (evaluator) |
+| `OPENAI_API_KEY` | gpt-4o-mini (analysts), gpt-4o (evaluator) and filing embeddings; not needed when the `LLM_*` provider is used |
+| `LLM_BASE_URL`, `LLM_API_KEY` | optional; any OpenAI-compatible provider for the chat models, e.g. `https://openrouter.ai/api/v1` or `https://api.cerebras.ai/v1` |
+| `LLM_MODEL_AGENTS`, `LLM_MODEL_EVALUATOR` | optional; model names on that provider (default `gpt-4o-mini`, `gpt-4o`) |
+| `EMBEDDING_BASE_URL`, `EMBEDDING_API_KEY`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSION` | optional; filing embeddings (default: the `LLM_*` provider, `text-embedding-3-small`, 1536). Cerebras has no embeddings |
 | `FRED_API_KEY` | macro data ([free key](https://fred.stlouisfed.org/docs/api/api_key.html)) |
 | `EDGAR_USER_AGENT` | SEC requires a contact, e.g. `folio-gauge you@example.com` |
 | `QDRANT_PATH` | optional; local vector index for SEC filings (default `data/qdrant`, no server needed) |

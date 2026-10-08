@@ -349,7 +349,7 @@ def _get_qdrant_client() -> QdrantClient:
         client.create_collection(
             collection_name=config.EDGAR_QDRANT_COLLECTION,
             vectors_config=VectorParams(
-                size=config.EDGAR_EMBEDDING_DIMENSION,
+                size=config.EMBEDDING_DIMENSION,
                 distance=Distance.COSINE,
             ),
         )
@@ -358,13 +358,13 @@ def _get_qdrant_client() -> QdrantClient:
 
 @lru_cache(maxsize=1)
 def _get_openai_client() -> OpenAI:
-    return OpenAI(max_retries=4)
+    return OpenAI(base_url=config.EMBEDDING_BASE_URL, api_key=config.EMBEDDING_API_KEY, max_retries=4)
 
 
 def _embed(texts: list[str]) -> list[list[float]]:
-    """Embed a list of texts using the configured OpenAI embedding model."""
+    """Embed a list of texts using the configured embedding model and provider."""
     response = _get_openai_client().embeddings.create(
-        model=config.EDGAR_EMBEDDING_MODEL,
+        model=config.EMBEDDING_MODEL,
         input=texts,
     )
     return [item.embedding for item in response.data]

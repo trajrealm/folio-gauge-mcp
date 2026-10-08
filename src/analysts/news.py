@@ -12,12 +12,12 @@ from __future__ import annotations
 
 from typing import Literal
 
-from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from src.agent.knowledge import load_prompt
 from src.agent.scoring import AgentScore, compute_confidence, decision_from_score
 from src.tools.news import NewsArticle, get_ticker_news
+from src.utils.llm import get_llm
 
 from .. import config
 
@@ -99,7 +99,7 @@ def analyze_news(ticker: str) -> AgentScore:
     if not feed.articles:
         return _neutral(ticker, f"No news in the last {config.NEWS_MAX_AGE_DAYS} days", data_gaps + ["No recent news"])
 
-    llm = ChatOpenAI(model=config.LLM_MODEL_AGENTS, temperature=config.LLM_TEMPERATURE_AGENTS)
+    llm = get_llm(config.LLM_MODEL_AGENTS, config.LLM_TEMPERATURE_AGENTS)
     result: NewsClassification = llm.with_structured_output(NewsClassification).invoke(
         [
             {"role": "system", "content": load_prompt("news")},

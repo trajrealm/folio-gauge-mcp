@@ -12,13 +12,13 @@ from __future__ import annotations
 
 from statistics import median
 
-from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from src.agent.knowledge import load_prompt
 from src.agent.scoring import AgentScore, compute_confidence, decision_from_score
 from src.tools.market import Fundamentals
 from src.tools.peers import QUALITY_METRICS, PeerComparison, compare_to_peers
+from src.utils.llm import get_llm
 
 from .. import config
 
@@ -127,7 +127,7 @@ Sector: {profile.sector or "n/a"}; industry: {profile.industry or "n/a"}
 
 Computed assessment (facts): {labels_text}"""
 
-    llm = ChatOpenAI(model=config.LLM_MODEL_AGENTS, temperature=config.LLM_TEMPERATURE_AGENTS)
+    llm = get_llm(config.LLM_MODEL_AGENTS, config.LLM_TEMPERATURE_AGENTS)
     analysis: PeersAnalysis = llm.with_structured_output(PeersAnalysis).invoke(
         [
             {"role": "system", "content": load_prompt("peers")},

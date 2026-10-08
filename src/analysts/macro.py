@@ -11,12 +11,12 @@ sector and scores. Errors propagate to the caller.
 from __future__ import annotations
 
 import yfinance as yf
-from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from src.agent.knowledge import load_prompt
 from src.agent.scoring import AgentScore, compute_confidence, decision_from_score
 from src.tools.fred import MacroSnapshot, get_macro_snapshot
+from src.utils.llm import get_llm
 
 from .. import config
 
@@ -89,7 +89,7 @@ def analyze_macro(ticker: str) -> AgentScore:
 
 Computed assessment (facts): {labels_text}"""
 
-    llm = ChatOpenAI(model=config.LLM_MODEL_AGENTS, temperature=config.LLM_TEMPERATURE_AGENTS)
+    llm = get_llm(config.LLM_MODEL_AGENTS, config.LLM_TEMPERATURE_AGENTS)
     analysis: MacroAnalysis = llm.with_structured_output(MacroAnalysis).invoke(
         [
             {"role": "system", "content": load_prompt("macro")},

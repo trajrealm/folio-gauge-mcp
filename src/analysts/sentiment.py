@@ -16,7 +16,6 @@ from __future__ import annotations
 
 from typing import Callable, Literal, TypeVar
 
-from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from src.agent.knowledge import load_prompt
@@ -24,6 +23,7 @@ from src.agent.scoring import AgentScore, compute_confidence, decision_from_scor
 from src.tools.polymarket import PolymarketMarket, fetch_polymarket_markets
 from src.tools.apewisdom import ApeWisdomMention, fetch_mentions
 from src.tools.stocktwits import StockTwitsSentiment, fetch_stocktwits_sentiment, fetch_stocktwits_trending
+from src.utils.llm import get_llm
 from src.utils.logger import get_logger
 
 from .. import config
@@ -141,7 +141,7 @@ def analyze_sentiment(ticker: str) -> AgentScore:
 
 Computed assessment (facts): {labels_text}"""
 
-    llm = ChatOpenAI(model=config.LLM_MODEL_AGENTS, temperature=config.LLM_TEMPERATURE_AGENTS)
+    llm = get_llm(config.LLM_MODEL_AGENTS, config.LLM_TEMPERATURE_AGENTS)
     analysis: SentimentAnalysis = llm.with_structured_output(SentimentAnalysis).invoke(
         [
             {"role": "system", "content": load_prompt("sentiment")},

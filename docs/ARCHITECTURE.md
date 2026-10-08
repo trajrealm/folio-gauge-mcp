@@ -264,7 +264,10 @@ Run: `uv run --directory <repo> python -m src.mcp.server`. Setup for Claude Desk
 
 | Variable | Used by |
 |---|---|
-| `OPENAI_API_KEY` | all LLM calls and filing embeddings |
+| `OPENAI_API_KEY` | chat models and embeddings, unless `LLM_*` / `EMBEDDING_*` point elsewhere |
+| `LLM_BASE_URL`, `LLM_API_KEY` | optional; OpenAI-compatible provider for the chat models (`utils/llm.py`) |
+| `LLM_MODEL_AGENTS`, `LLM_MODEL_EVALUATOR` | optional; default `gpt-4o-mini`, `gpt-4o` |
+| `EMBEDDING_BASE_URL`, `EMBEDDING_API_KEY`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSION` | optional; filing embeddings (`tools/edgar.py`), default the `LLM_*` provider; one Qdrant collection per model |
 | `FRED_API_KEY` | `tools/fred.py` |
 | `EDGAR_USER_AGENT` | `tools/edgar.py` (SEC requires a contact, e.g. "folio-gauge you@example.com") |
 | `QDRANT_PATH` | optional; local Qdrant directory (default `data/qdrant`) |

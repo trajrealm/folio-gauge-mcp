@@ -10,12 +10,12 @@ Errors propagate to the caller.
 
 from __future__ import annotations
 
-from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from src.agent.knowledge import load_prompt
 from src.agent.scoring import AgentScore, compute_confidence, decision_from_score
 from src.tools.technical import TechnicalSnapshot, get_technical_snapshot
+from src.utils.llm import get_llm
 
 from .. import config
 
@@ -129,7 +129,7 @@ def analyze_technical(ticker: str) -> AgentScore:
 
 Computed assessment (facts): {labels_text}"""
 
-    llm = ChatOpenAI(model=config.LLM_MODEL_AGENTS, temperature=config.LLM_TEMPERATURE_AGENTS)
+    llm = get_llm(config.LLM_MODEL_AGENTS, config.LLM_TEMPERATURE_AGENTS)
     analysis: TechnicalAnalysis = llm.with_structured_output(TechnicalAnalysis).invoke(
         [
             {"role": "system", "content": load_prompt("technical")},

@@ -11,12 +11,12 @@ quality belong to the earnings analyst. Errors propagate to the caller.
 
 from __future__ import annotations
 
-from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from src.agent.knowledge import load_prompt
 from src.agent.scoring import AgentScore, compute_confidence, decision_from_score
 from src.tools.market import Fundamentals, get_ticker_snapshot
+from src.utils.llm import get_llm
 
 from .. import config
 
@@ -136,7 +136,7 @@ Sector: {profile.sector or "n/a"}; industry: {profile.industry or "n/a"}; market
 
 Computed assessment (facts): {labels_text}"""
 
-    llm = ChatOpenAI(model=config.LLM_MODEL_AGENTS, temperature=config.LLM_TEMPERATURE_AGENTS)
+    llm = get_llm(config.LLM_MODEL_AGENTS, config.LLM_TEMPERATURE_AGENTS)
     analysis: FundamentalsAnalysis = llm.with_structured_output(FundamentalsAnalysis).invoke(
         [
             {"role": "system", "content": load_prompt("fundamentals")},
