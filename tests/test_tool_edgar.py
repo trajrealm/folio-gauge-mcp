@@ -54,7 +54,7 @@ excerpt = (summary.text_excerpt or "") if summary else ""
 print(f"  {len(excerpt)} chars: {excerpt[:200]}...\n")
 
 print("-- Ingest (MD&A + earnings press releases) --")
-print(f"  Filings in index: {ingest_filings(TICKER)}\n")
+print(f"  Filings in index: {len(ingest_filings(TICKER))}\n")
 
 print("-- Query --")
 for filing_type in ("10-K", "10-Q", "8-K"):

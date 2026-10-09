@@ -108,4 +108,16 @@ uv run python -m tests.test_orchestrator [TICKER]    # full analysis
 uv run python -m tests.test_portfolio_review [--analyze]
 uv run python -m tests.test_discovery [--analyze]
 uv run python -m tests.test_mcp_server [TICKER] [--full]  # MCP server over stdio
+uv run python -m tests.test_backtest_earnings [TICKERS]   # earnings backtest, 3 tickers
+```
+
+## Backtest (earnings analyst)
+
+Runs the earnings analyst as of every 10-Q/10-K filing date since 2023-10 and compares its score with the stock's later return in excess of SPY:
+
+```bash
+uv run python -m src.backtest.earnings build --tickers AAPL,MSFT,JPM   # or a .csv with a symbol column
+uv run python -m src.backtest.earnings score                           # LLM scores; rerun per model
+uv run python -m src.backtest.earnings score --batch                   # or one batch job, ~half price
+uv run python -m src.backtest.earnings evaluate                        # returns and report
 ```

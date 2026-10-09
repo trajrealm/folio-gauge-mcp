@@ -9,7 +9,12 @@ Endpoints used:
   - /api/xbrl/companyfacts/CIK{cik}.json   -> structured financials (XBRL)
   - Archives/.../{accession}-index.htm     -> filing index (exhibit lookup)
 
-EDGAR rate limit: max 10 req/sec. Requests are spaced 0.15s apart.
+EDGAR rate limit: max 10 req/sec. Requests from all threads are spaced
+config.EDGAR_MIN_INTERVAL apart.
+
+as_of: get_company_filings, get_earnings_facts and ingest_filings take an
+optional date and then see only what was filed on or before it (backtests).
+Submissions and company facts are cached for the day.
 
 Numbers come from XBRL (get_earnings_facts). Narrative text - MD&A from the
 latest 10-K and 10-Q, and the press release (Exhibit 99.1) of recent
@@ -25,6 +30,7 @@ import threading
 import time
 import uuid
 import warnings
+from datetime import date, timedelta
 from functools import lru_cache
 from typing import Callable, Literal, TypeVar
 
@@ -120,10 +126,22 @@ class FilingQueryResult(BaseModel):
     filed_dates: list[str]
 
 
+_rate_lock = threading.Lock()
+_last_request = 0.0
+
+
+def _throttle() -> None:
+    """Space requests from all threads config.EDGAR_MIN_INTERVAL apart (SEC allows 10/s)."""
+    global _last_request
+    with _rate_lock:
+        time.sleep(max(0.0, _last_request + config.EDGAR_MIN_INTERVAL - time.monotonic()))
+        _last_request = time.monotonic()
+
+
 @retry_transient
 def _get(url: str) -> dict:
     """GET JSON with retry on transient errors and polite rate limiting."""
-    time.sleep(0.15)
+    _throttle()
     response = _http.get(url)
     response.raise_for_status()
     return response.json()
@@ -132,7 +150,7 @@ def _get(url: str) -> dict:
 @retry_transient
 def _get_text(url: str) -> str:
     """GET raw text (for HTML filing docs)."""
-    time.sleep(0.15)
+    _throttle()
     response = _http.get(url)
     response.raise_for_status()
     return response.text
@@ -154,82 +172,150 @@ def resolve_cik(symbol: str) -> str:
     return cik
 
 
-def get_company_filings(symbol: str) -> CompanyFilings:
-    """
-    Fetch recent 10-K, 10-Q, and earnings 8-K filings for a ticker.
-    Returns structured metadata - does NOT download full text.
-    """
-    symbol = symbol.upper()
-    cik = resolve_cik(symbol)
-    data = _get(f"{config.EDGAR_BASE_URL}/submissions/CIK{cik}.json")
-    recent = data["filings"]["recent"]
-
-    def build_meta(i: int) -> FilingMeta:
-        acc = recent["accessionNumber"][i]
-        return FilingMeta(
+def _earnings_filings(symbol: str, cik: str, columns: dict) -> list[FilingMeta]:
+    """10-K, 10-Q and earnings 8-K (item 2.02) rows of a submissions table, as FilingMeta."""
+    return [
+        FilingMeta(
             symbol=symbol,
             cik=cik,
-            filing_type=recent["form"][i],
-            filed_date=recent["filingDate"][i],
-            report_date=recent["reportDate"][i] or None,
+            filing_type=form,
+            filed_date=columns["filingDate"][i],
+            report_date=columns["reportDate"][i] or None,
             accession_number=acc,
             url=f"{config.EDGAR_ARCHIVES_URL}/{int(cik)}/{acc.replace('-', '')}/"
-            f"{recent['primaryDocument'][i]}",
+            f"{columns['primaryDocument'][i]}",
         )
+        for i, (form, acc) in enumerate(zip(columns["form"], columns["accessionNumber"]))
+        if form in ("10-K", "10-Q") or (form == "8-K" and "2.02" in columns["items"][i])
+    ]
 
-    recent_10k: FilingMeta | None = None
-    recent_10q: list[FilingMeta] = []
-    recent_8k: list[FilingMeta] = []
 
-    for i, form in enumerate(recent["form"]):
-        if form == "10-K" and recent_10k is None:
-            recent_10k = build_meta(i)
-        elif form == "10-Q" and len(recent_10q) < config.EDGAR_RECENT_10Q_COUNT:
-            recent_10q.append(build_meta(i))
-        elif (
-            form == "8-K"
-            and "2.02" in recent["items"][i]
-            and len(recent_8k) < config.EDGAR_RECENT_8K_COUNT
-        ):
-            recent_8k.append(build_meta(i))
+@lru_cache(maxsize=64)
+def _submissions(symbol: str, day: date) -> dict:
+    """Company name, SIC, recent earnings filings and the older pages; cached for the day."""
+    cik = resolve_cik(symbol)
+    data = _get(f"{config.EDGAR_BASE_URL}/submissions/CIK{cik}.json")
+    return {
+        "cik": cik,
+        "name": data["name"],
+        "sic": data["sic"],
+        "recent": _earnings_filings(symbol, cik, data["filings"]["recent"]),
+        "pages": data["filings"]["files"],
+    }
+
+
+@lru_cache(maxsize=1024)
+def _submissions_page(symbol: str, cik: str, name: str, day: date) -> list[FilingMeta]:
+    """Earnings filings from one older submissions page; cached for the day."""
+    return _earnings_filings(symbol, cik, _get(f"{config.EDGAR_BASE_URL}/submissions/{name}"))
+
+
+def get_filings_since(symbol: str, since: date) -> list[FilingMeta]:
+    """
+    All 10-K, 10-Q and earnings 8-K filings filed on or after `since`, newest first.
+    The main submissions file holds about a year for large filers (banks file
+    thousands of prospectuses), so older pages are read as needed.
+    """
+    symbol = symbol.upper()
+    sub = _submissions(symbol, date.today())
+    filings = list(sub["recent"])
+    for page in sub["pages"]:
+        if page["filingTo"] >= since.isoformat():
+            filings += _submissions_page(symbol, sub["cik"], page["name"], date.today())
+    filings = [f for f in filings if f.filed_date >= since.isoformat()]
+    return sorted(filings, key=lambda f: f.filed_date, reverse=True)
+
+
+def get_company_filings(symbol: str, as_of: date | None = None) -> CompanyFilings:
+    """
+    Recent 10-K, 10-Q and earnings 8-K filings for a ticker, as of a date
+    (default: today). Returns structured metadata - does NOT download full text.
+    """
+    symbol = symbol.upper()
+    sub = _submissions(symbol, date.today())
+    if as_of is None:
+        filings = sub["recent"]
+    else:
+        since = as_of - timedelta(days=config.EDGAR_LOOKBACK_DAYS)
+        filings = [f for f in get_filings_since(symbol, since) if f.filed_date <= as_of.isoformat()]
 
     return CompanyFilings(
         symbol=symbol,
-        cik=cik,
-        company_name=data["name"],
-        recent_10k=recent_10k,
-        recent_10q=recent_10q,
-        recent_8k=recent_8k,
+        cik=sub["cik"],
+        company_name=sub["name"],
+        recent_10k=next((f for f in filings if f.filing_type == "10-K"), None),
+        recent_10q=[f for f in filings if f.filing_type == "10-Q"][: config.EDGAR_RECENT_10Q_COUNT],
+        recent_8k=[f for f in filings if f.filing_type == "8-K"][: config.EDGAR_RECENT_8K_COUNT],
     )
 
 
-def get_earnings_facts(symbol: str) -> EarningsFacts:
+@lru_cache(maxsize=64)
+def _fact_rows(cik: str, day: date) -> tuple[str, dict[str, list[dict]]]:
+    """Entity name and the XBRL rows of every configured concept; cached for the day."""
+    data = _get(f"{config.EDGAR_BASE_URL}/api/xbrl/companyfacts/CIK{cik}.json")
+    gaap = data["facts"].get("us-gaap", {})
+    concepts = {c for names in config.EDGAR_FACT_CONCEPTS.values() for c in names if c in gaap}
+    return data["entityName"], {c: next(iter(gaap[c]["units"].values())) for c in concepts}
+
+
+def period_key(start: str, end: str) -> str | None:
     """
-    Fetch annual and quarterly EPS, revenue, net income and operating cash
-    flow from XBRL company facts. SEC frames give one value per period.
+    SEC-style calendar label of a reported period: CY2025 for a fiscal year,
+    CY2025Q3 for a quarter, None for other durations (e.g. 6- or 9-month YTD).
+    A period belongs to the calendar year or quarter holding its midpoint; a
+    July-June year (midpoint Dec 30/31) goes to the year it ends in, as SEC does.
+    Matches SEC frames for every period since 2021 of 22 tested companies.
+    """
+    first, last = date.fromisoformat(start), date.fromisoformat(end)
+    days, mid = (last - first).days, first + (last - first) / 2
+    if 350 <= days <= 380:
+        return f"CY{(mid + timedelta(days=7)).year}"
+    if 80 <= days <= 120:  # 12- to 16-week retail quarters included
+        return f"CY{mid.year}Q{(mid.month - 1) // 3 + 1}"
+    return None
+
+
+def periods(rows: list[dict]) -> tuple[dict[str, float], dict[str, float]]:
+    """
+    Annual and quarterly values from XBRL rows. A period reported again later
+    (comparatives, restatements) keeps its latest filed value. SEC's frame tag
+    is not used: it marks the latest filing overall, which leaks into backtests.
+    """
+    annual: dict[str, float] = {}
+    quarterly: dict[str, float] = {}
+    for row in sorted(rows, key=lambda r: r["filed"]):
+        key = period_key(row["start"], row["end"]) if "start" in row else None
+        if key:
+            (quarterly if "Q" in key else annual)[key] = row["val"]
+    return annual, quarterly
+
+
+def get_earnings_facts(symbol: str, as_of: date | None = None) -> EarningsFacts:
+    """
+    Annual and quarterly EPS, revenue, net income and operating cash flow from
+    XBRL company facts, as filed on or before as_of (default: today).
+    Of several concepts for a metric, the one with the latest period is used.
     SIC 6000-6499 (banks, brokers, insurers) marks the company as financial.
     Foreign filers (IFRS, 20-F) have no us-gaap facts and return empty dicts.
     """
     symbol = symbol.upper()
-    cik = resolve_cik(symbol)
-    sic = _get(f"{config.EDGAR_BASE_URL}/submissions/CIK{cik}.json")["sic"]
-    data = _get(f"{config.EDGAR_BASE_URL}/api/xbrl/companyfacts/CIK{cik}.json")
-    gaap = data["facts"].get("us-gaap", {})
+    cutoff = (as_of or date.today()).isoformat()
+    sub = _submissions(symbol, date.today())
+    name, rows_by_concept = _fact_rows(sub["cik"], date.today())
 
     annual: dict[str, dict[str, float]] = {}
     quarterly: dict[str, dict[str, float]] = {}
     for metric, concepts in config.EDGAR_FACT_CONCEPTS.items():
-        candidates = [next(iter(gaap[c]["units"].values())) for c in concepts if c in gaap]
-        if not candidates:
-            continue
-        rows = max(candidates, key=lambda rows: max(r["end"] for r in rows))
-        framed = {r["frame"]: r["val"] for r in rows if "frame" in r}
-        annual[metric] = {f: v for f, v in framed.items() if re.fullmatch(r"CY\d{4}", f)}
-        quarterly[metric] = {f: v for f, v in framed.items() if re.fullmatch(r"CY\d{4}Q\d", f)}
+        candidates = [[r for r in rows_by_concept[c] if r["filed"] <= cutoff] for c in concepts if c in rows_by_concept]
+        candidates = [rows for rows in candidates if rows]
+        if candidates:
+            rows = max(candidates, key=lambda rows: max(r["end"] for r in rows))
+            annual[metric], quarterly[metric] = periods(rows)
 
+    sic = sub["sic"]
     return EarningsFacts(
         symbol=symbol,
-        company_name=data["entityName"],
+        company_name=name,
         is_financial=sic.isdigit() and 6000 <= int(sic) < 6500,
         annual=annual,
         quarterly=quarterly,
@@ -437,18 +523,18 @@ def _prune_stale_filings(client: QdrantClient, symbol: str, keep_accessions: lis
     )
 
 
-def ingest_filings(symbol: str) -> int:
+def ingest_filings(symbol: str, as_of: date | None = None) -> list[str]:
     """
-    Embed the narrative of recent filings into Qdrant:
+    Embed the narrative of recent filings (as of a date, default today) into Qdrant:
       - MD&A of the most recent 10-K and 10-Q
       - press release of the latest earnings 8-Ks (config.EDGAR_NUMBER_8K_IN_SUMMARY)
 
-    Filings already stored are skipped; stored filings no longer in the
-    current set are removed. Safe to call on every analysis run.
-    Returns the number of filings in the current set.
+    Filings already stored are skipped. Without as_of, stored filings no longer
+    in the current set are removed. Safe to call on every analysis run.
+    Returns the accession numbers of the current set (to filter query_filings).
     """
     symbol = symbol.upper()
-    filings = get_company_filings(symbol)
+    filings = get_company_filings(symbol, as_of)
 
     to_ingest = [
         f
@@ -491,28 +577,45 @@ def ingest_filings(symbol: str) -> int:
             f"Ingested {symbol} {filing.filing_type} ({filing.filed_date}): {len(chunks)} chunks"
         )
 
-    if to_ingest:
-        keep = [f.accession_number for f in to_ingest]
+    keep = [f.accession_number for f in to_ingest]
+    if keep and as_of is None:
         _qdrant(lambda client: _prune_stale_filings(client, symbol, keep))
 
-    return len(to_ingest)
+    return keep
+
+
+def delete_filings(symbol: str) -> None:
+    """Remove every stored chunk of a ticker (backtests clean up per ticker)."""
+    _qdrant(
+        lambda client: client.delete(
+            collection_name=config.EDGAR_QDRANT_COLLECTION,
+            points_selector=FilterSelector(filter=_symbol_filter(symbol.upper())),
+        )
+    )
 
 
 def query_filings(
-    symbol: str, question: str, filing_type: str | None = None
+    symbol: str,
+    question: str,
+    filing_type: str | None = None,
+    accessions: list[str] | None = None,
 ) -> FilingQueryResult:
     """
-    Query Qdrant for chunks relevant to a question about a ticker's filings.
+    Query Qdrant for chunks relevant to a question about a ticker's filings,
+    optionally only from the given filings (accession numbers).
     """
     symbol = symbol.upper()
     match = {"filing_type": filing_type} if filing_type else {}
+    query_filter = _symbol_filter(symbol, **match)
+    if accessions is not None:
+        query_filter.must.append(FieldCondition(key="accession_number", match=MatchAny(any=accessions)))
 
     vector = _embed([question])[0]
     results = _qdrant(
         lambda client: client.query_points(
             collection_name=config.EDGAR_QDRANT_COLLECTION,
             query=vector,
-            query_filter=_symbol_filter(symbol, **match),
+            query_filter=query_filter,
             limit=config.EDGAR_TOP_K_RESULTS,
             with_payload=True,
         )

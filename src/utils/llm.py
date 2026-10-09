@@ -9,11 +9,14 @@ from langchain_openai import ChatOpenAI
 from src import config
 
 
+def is_openrouter() -> bool:
+    return "openrouter.ai" in (config.LLM_BASE_URL or "")
+
+
 def get_llm(model: str, temperature: float) -> ChatOpenAI:
     # OpenRouter routes a model to one of several hosts; require one that supports
     # every parameter sent, so structured output is never silently dropped.
-    openrouter = "openrouter.ai" in (config.LLM_BASE_URL or "")
-    extra_body = {"provider": {"require_parameters": True}} if openrouter else None
+    extra_body = {"provider": {"require_parameters": True}} if is_openrouter() else None
     return ChatOpenAI(
         model=model,
         temperature=temperature,

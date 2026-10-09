@@ -10,6 +10,10 @@ Combines two SEC sources:
 
 Filings do not contain analyst consensus estimates, so beat/miss versus
 expectations is not assessed. Errors propagate to the caller.
+
+build_earnings_context (data and labels, in code) and score_earnings (the LLM)
+are separate so a backtest can build contexts as of past dates once and
+score them many times.
 """
 
 from __future__ import annotations
@@ -49,6 +53,19 @@ SIGNALS = {
     "raised": 1, "maintained": 0, "lowered": -1, "withdrawn": -1,
     "high": 1, "medium": 0, "low": -1,
 }  # fmt: skip
+
+
+class EarningsContext(BaseModel):
+    """Everything the LLM sees for one ticker as of a date, with the labels computed in code."""
+
+    symbol: str
+    as_of: date
+    eps_trend: str | None
+    momentum: str | None
+    quality: str | None
+    coverage: float  # share of sources present: XBRL financials and each filing type's narrative
+    data_gaps: list[str]
+    prompt: str | None  # None when there is no SEC data at all
 
 
 class EarningsAnalysis(BaseModel):
@@ -145,17 +162,17 @@ def _format_financials(facts: EarningsFacts) -> str:
     return "\n".join(lines)
 
 
-def _retrieve_narrative(symbol: str) -> dict[str, str]:
+def _retrieve_narrative(symbol: str, accessions: list[str]) -> dict[str, str]:
     """
-    Query the vector DB per filing type. Chunks already returned for an
-    earlier question are not repeated. Returns {filing_type: section}.
+    Query the vector DB per filing type, within the given filings. Chunks already
+    returned for an earlier question are not repeated. Returns {filing_type: section}.
     """
     sections: dict[str, str] = {}
     for filing_type, questions in NARRATIVE_QUESTIONS.items():
         seen: set[str] = set()
         parts: list[str] = []
         for question in questions:
-            result = query_filings(symbol, question, filing_type=filing_type)
+            result = query_filings(symbol, question, filing_type=filing_type, accessions=accessions)
             chunks = [c for c in result.answer_chunks if c not in seen]
             seen.update(chunks)
             if chunks:
@@ -166,73 +183,103 @@ def _retrieve_narrative(symbol: str) -> dict[str, str]:
     return sections
 
 
-def analyze_earnings(ticker: str) -> AgentScore:
+def build_earnings_context(ticker: str, as_of: date | None = None) -> EarningsContext:
     """
-    Flow:
-      1. Fetch XBRL financials and format them with YoY growth
-      2. Ingest new filing narrative into Qdrant and query it
-      3. Compute EPS trend, quarterly momentum and cash-conversion quality labels in code
-      4. LLM reads guidance from the narrative and scores; decision is derived from the score
-      5. Confidence = source coverage x agreement of EPS trend, momentum, guidance and quality
+    Fetch XBRL financials and filing narrative filed on or before as_of (default
+    today), compute EPS trend, quarterly momentum and cash-conversion quality,
+    and assemble the LLM prompt.
     """
     data_gaps: list[str] = []
 
-    facts = get_earnings_facts(ticker)
+    facts = get_earnings_facts(ticker, as_of)
     if not facts.annual:
         data_gaps.append("No US-GAAP XBRL financials (foreign filers report IFRS on 20-F)")
 
-    ingest_filings(ticker)
-    narrative = _retrieve_narrative(ticker)
+    accessions = ingest_filings(ticker, as_of)
+    narrative = _retrieve_narrative(ticker, accessions) if accessions else {}
     data_gaps += [f"No {t} narrative retrieved" for t in NARRATIVE_QUESTIONS if t not in narrative]
 
+    sources = [bool(facts.annual), *(t in narrative for t in NARRATIVE_QUESTIONS)]
+    eps_trend, momentum, quality = _eps_trend(facts), _momentum(facts), _cash_quality(facts)
+    context = EarningsContext(
+        symbol=ticker,
+        as_of=as_of or date.today(),
+        eps_trend=eps_trend,
+        momentum=momentum,
+        quality=quality,
+        coverage=sum(sources) / len(sources),
+        data_gaps=data_gaps,
+        prompt=None,
+    )
     if not facts.annual and not narrative:
-        return AgentScore(
+        return context
+
+    parts = []
+    if facts.annual:
+        parts.append(f"=== Reported financials (XBRL) ===\n{_format_financials(facts)}")
+    parts += [f"=== {t} excerpts ===\n{section}" for t, section in narrative.items()]
+    context_text = "\n\n".join(parts)
+
+    context.prompt = f"""Today is {context.as_of}. Analyze {ticker}'s earnings performance and outlook from these SEC data.
+All financials are reported actuals, oldest to newest; the last period is the most recent.
+
+{context_text}
+
+Computed assessment (facts): {_labels_text(context)}
+Data gaps: {", ".join(data_gaps) or "none"}"""
+    return context
+
+
+def _labels_text(context: EarningsContext) -> str:
+    return (
+        f"EPS trend (latest annual YoY): {context.eps_trend or 'not assessable'}; "
+        f"quarterly momentum (latest quarter vs annual EPS YoY): {context.momentum or 'not assessable'}; "
+        f"earnings quality (cash conversion): {context.quality or 'not assessable'}"
+    )
+
+
+def score_earnings(
+    context: EarningsContext, temperature: float = config.LLM_TEMPERATURE_AGENTS
+) -> tuple[AgentScore, EarningsAnalysis | None]:
+    """
+    LLM reads guidance from the narrative and scores; the decision is derived from
+    the score. Confidence = source coverage x agreement of EPS trend, momentum,
+    guidance and quality. Returns the score and the raw analysis (None without data).
+    """
+    if context.prompt is None:
+        score = AgentScore(
             agent="earnings",
-            symbol=ticker,
+            symbol=context.symbol,
             decision="HOLD",
             score=3,
             timeframe="mid",
             reasoning="No SEC earnings data available",
             confidence=0.1,
-            data_gaps=data_gaps,
+            data_gaps=context.data_gaps,
         )
+        return score, None
 
-    eps_trend, momentum, quality = _eps_trend(facts), _momentum(facts), _cash_quality(facts)
-    labels_text = (
-        f"EPS trend (latest annual YoY): {eps_trend or 'not assessable'}; "
-        f"quarterly momentum (latest quarter vs annual EPS YoY): {momentum or 'not assessable'}; "
-        f"earnings quality (cash conversion): {quality or 'not assessable'}"
-    )
-
-    context = []
-    if facts.annual:
-        context.append(f"=== Reported financials (XBRL) ===\n{_format_financials(facts)}")
-    context += [f"=== {t} excerpts ===\n{section}" for t, section in narrative.items()]
-    context_text = "\n\n".join(context)
-
-    user_prompt = f"""Today is {date.today()}. Analyze {ticker}'s earnings performance and outlook from these SEC data.
-All financials are reported actuals, oldest to newest; the last period is the most recent.
-
-{context_text}
-
-Computed assessment (facts): {labels_text}
-Data gaps: {", ".join(data_gaps) or "none"}"""
-
-    llm = get_llm(config.LLM_MODEL_AGENTS, config.LLM_TEMPERATURE_AGENTS)
+    llm = get_llm(config.LLM_MODEL_AGENTS, temperature)
     analysis: EarningsAnalysis = llm.with_structured_output(EarningsAnalysis).invoke(
-        [
-            {"role": "system", "content": load_prompt("earnings")},
-            {"role": "user", "content": user_prompt},
-        ],
-        config={"run_name": "Earnings Agent"},
+        earnings_messages(context), config={"run_name": "Earnings Agent"}
     )
+    return finish_earnings(context, analysis), analysis
 
-    sources = [bool(facts.annual), *(t in narrative for t in NARRATIVE_QUESTIONS)]
-    coverage = sum(sources) / len(sources)
-    labels = (eps_trend, momentum, analysis.guidance_signal, quality)
+
+def earnings_messages(context: EarningsContext) -> list[dict]:
+    """System and user messages for a context that has a prompt."""
+    return [
+        {"role": "system", "content": load_prompt("earnings")},
+        {"role": "user", "content": context.prompt},
+    ]
+
+
+def finish_earnings(context: EarningsContext, analysis: EarningsAnalysis) -> AgentScore:
+    """AgentScore from the LLM analysis: decision from the score, confidence in code."""
+    labels = (context.eps_trend, context.momentum, analysis.guidance_signal, context.quality)
     signals = [SIGNALS[v] for v in labels if v in SIGNALS]
 
-    parts = [analysis.reasoning, f"{labels_text}; guidance: {analysis.guidance_signal}."]
+    parts = [analysis.reasoning, f"{_labels_text(context)}; guidance: {analysis.guidance_signal}."]
     if analysis.key_signals:
         parts.append("Key signals: " + ", ".join(analysis.key_signals) + ".")
     if analysis.risk_flags:
@@ -240,11 +287,16 @@ Data gaps: {", ".join(data_gaps) or "none"}"""
 
     return AgentScore(
         agent="earnings",
-        symbol=ticker,
+        symbol=context.symbol,
         decision=decision_from_score(analysis.score),
         score=analysis.score,
         timeframe="mid",
         reasoning="Earnings: " + " ".join(parts),
-        confidence=compute_confidence(coverage, signals),
-        data_gaps=data_gaps,
+        confidence=compute_confidence(context.coverage, signals),
+        data_gaps=context.data_gaps,
     )
+
+
+def analyze_earnings(ticker: str) -> AgentScore:
+    """Score a ticker's earnings as of today."""
+    return score_earnings(build_earnings_context(ticker))[0]

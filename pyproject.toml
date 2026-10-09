@@ -33,4 +33,4 @@ dev = [
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
-testpaths = ["tests/test_config.py", "tests/test_aggregator.py", "tests/test_evaluator.py"]
+testpaths = ["tests/test_config.py", "tests/test_aggregator.py", "tests/test_evaluator.py", "tests/test_backtest.py", "tests/test_batch.py"]

@@ -67,6 +67,8 @@ EDGAR_RECENT_10Q_COUNT: int = 4
 EDGAR_RECENT_8K_COUNT: int = 5
 EDGAR_NUMBER_8K_IN_SUMMARY: int = 3
 EDGAR_MAX_CHARS: int = 4000
+EDGAR_MIN_INTERVAL: float = 0.12  # seconds between SEC requests across threads (limit 10/s)
+EDGAR_LOOKBACK_DAYS: int = 400  # as-of filing search window: covers the prior 10-K
 # XBRL concepts per metric; the first concept with the most recent data wins.
 EDGAR_FACT_CONCEPTS: dict[str, tuple[str, ...]] = {
     "eps_diluted": ("EarningsPerShareDiluted",),
@@ -221,3 +223,13 @@ DISCOVERY_LIMIT: int = 10
 # Batch analysis (portfolio review, discovery): tickers analyzed at once.
 # Each ticker already runs 8 analysts in parallel; more would strain the data APIs.
 ANALYSIS_WORKERS: int = 3
+
+# Earnings backtest (src/backtest/earnings.py)
+BACKTEST_START: str = "2023-10-01"  # after gpt-4o-mini's training cutoff (Oct 2023)
+BACKTEST_QDRANT_PATH: str = "data/qdrant_backtest"  # kept apart from the live filing index
+BACKTEST_BUILD_WORKERS: int = 4  # tickers at once; SEC requests are throttled across threads
+BACKTEST_SCORE_WORKERS: int = 8  # LLM calls at once
+BACKTEST_TEMPERATURE: float = 0.0  # repeatable scores
+BACKTEST_HORIZONS: tuple[int, ...] = (21, 63, 126)  # trading days; 63 is the primary one
+BACKTEST_MIN_GROUP: int = 10  # fewest samples in a quarter to compute its rank correlation
+BATCH_POLL_SECONDS: int = 60  # batch scoring (score --batch): status check interval
