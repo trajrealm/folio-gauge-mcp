@@ -3,18 +3,18 @@ src/analysts/sector.py
 Sector Analyst Agent
 
 Judges sector tailwinds and the stock's position within its sector from
-relative returns (tools/sector.py). Labels are computed in code and given
-to the LLM as facts; the LLM judges the combination and scores.
+relative returns (tools/sector.py). The agent calls get_sector_trend_facts,
+which returns the returns and labels computed in code (facts); the LLM judges the combination and scores.
 Errors propagate to the caller.
 """
 
 from __future__ import annotations
 
-from langchain_openai import ChatOpenAI
+from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
-from src.agent.knowledge import load_prompt
 from src.agent.scoring import AgentScore, compute_confidence, decision_from_score
+from src.agent.tool_agent import run_tool_agent
 from src.tools.sector import SectorTrend, get_sector_trend
 
 from .. import config
@@ -63,26 +63,13 @@ def _format_trend(t: SectorTrend) -> str:
     )
 
 
-def analyze_sector(ticker: str) -> AgentScore:
-    """
-    Flow:
-      1. Fetch stock, sector ETF and market returns (tools/sector.py)
-      2. Compute sector-vs-market and stock-vs-sector labels in code
-      3. LLM judges the combination and scores; decision is derived from the score
-      4. Confidence = label coverage x agreement of the two labels
-    """
+@tool(response_format="content_and_artifact")
+def get_sector_trend_facts(ticker: str) -> tuple[str, dict | None]:
+    """Fetch 1/3/6-month returns of a stock, its sector ETF and the market, with
+    sector-vs-market and stock-vs-sector labels computed in code. Treat all of it as facts."""
     trend = get_sector_trend(ticker)
     if trend.sector_etf is None:
-        return AgentScore(
-            agent="sector",
-            symbol=ticker,
-            decision="HOLD",
-            score=3,
-            timeframe="mid",
-            reasoning=f"No sector ETF for sector '{trend.sector}'",
-            confidence=0.1,
-            data_gaps=[f"No sector ETF mapped for '{trend.sector}'"],
-        )
+        return f"No sector ETF mapped for sector '{trend.sector}'.", {"no_etf_sector": trend.sector}
 
     signals = {
         "sector_vs_market": _signal(trend.sector_vs_market),
@@ -93,22 +80,40 @@ def analyze_sector(ticker: str) -> AgentScore:
         f"sector vs market: {labels['sector_vs_market']}; "
         f"stock vs sector: {labels['stock_vs_sector']}"
     )
-
-    user_prompt = f"""Assess the sector trend for {ticker} (sector: {trend.sector}).
+    content = f"""{ticker} (sector: {trend.sector})
 
 {_format_trend(trend)}
 
 Computed assessment (facts): {labels_text}"""
+    return content, {"signals": signals, "labels_text": labels_text}
 
-    llm = ChatOpenAI(model=config.LLM_MODEL_AGENTS, temperature=config.LLM_TEMPERATURE_AGENTS)
-    analysis: SectorAnalysis = llm.with_structured_output(SectorAnalysis).invoke(
-        [
-            {"role": "system", "content": load_prompt("sector")},
-            {"role": "user", "content": user_prompt},
-        ],
-        config={"run_name": "Sector Agent"},
+
+def analyze_sector(ticker: str) -> AgentScore:
+    """
+    Flow:
+      1. Agent calls get_sector_trend_facts (stock, sector ETF and market returns from
+         tools/sector.py; sector-vs-market and stock-vs-sector labels in code)
+      2. LLM judges the combination and scores; decision is derived from the score
+      3. Confidence = label coverage x agreement of the two labels
+    """
+    analysis, artifacts = run_tool_agent(
+        "sector", [get_sector_trend_facts], SectorAnalysis, f"Assess the sector trend for {ticker}."
     )
+    artifact = artifacts["get_sector_trend_facts"]
+    if "no_etf_sector" in artifact:
+        sector = artifact["no_etf_sector"]
+        return AgentScore(
+            agent="sector",
+            symbol=ticker,
+            decision="HOLD",
+            score=3,
+            timeframe="mid",
+            reasoning=f"No sector ETF for sector '{sector}'",
+            confidence=0.1,
+            data_gaps=[f"No sector ETF mapped for '{sector}'"],
+        )
 
+    signals, labels_text = artifact["signals"], artifact["labels_text"]
     available = [v for v in signals.values() if v is not None]
     data_gaps = [f"{k} not assessable (short history)" for k, v in signals.items() if v is None]
 

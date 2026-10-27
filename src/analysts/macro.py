@@ -3,19 +3,19 @@ src/analysts/macro.py
 Macro Analyst Agent
 
 The macro regime (rates, inflation, labor, growth, yield curve, volatility)
-is labelled in code from the FRED snapshot and given to the LLM as facts,
-with the stock's sector. The LLM judges how this backdrop affects that
-sector and scores. Errors propagate to the caller.
+is labelled in code from the FRED snapshot. The agent calls two tools, one
+for these indicators and labels (facts) and one for the stock's sector. The
+LLM judges how this backdrop affects that sector and scores. Errors propagate to the caller.
 """
 
 from __future__ import annotations
 
 import yfinance as yf
-from langchain_openai import ChatOpenAI
+from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
-from src.agent.knowledge import load_prompt
 from src.agent.scoring import AgentScore, compute_confidence, decision_from_score
+from src.agent.tool_agent import run_tool_agent
 from src.tools.fred import MacroSnapshot, get_macro_snapshot
 
 from .. import config
@@ -70,34 +70,39 @@ def _format_snapshot(m: MacroSnapshot) -> str:
     )
 
 
+@tool(response_format="content_and_artifact")
+def get_macro_indicators() -> tuple[str, dict[str, str]]:
+    """Fetch the US macro snapshot (fed funds, CPI, unemployment and Sahm, GDP growth,
+    yield curve, VIX) with regime labels computed in code. Treat all of it as facts."""
+    snapshot = get_macro_snapshot()
+    labels = _labels(snapshot)
+    labels_text = "; ".join(f"{k}: {v}" for k, v in labels.items())
+    return f"{_format_snapshot(snapshot)}\n\nComputed assessment (facts): {labels_text}", labels
+
+
+@tool(response_format="content_and_artifact")
+def get_company_sector(ticker: str) -> tuple[str, str | None]:
+    """Look up the sector of a stock ticker."""
+    sector = yf.Ticker(ticker).info.get("sector")
+    return f"{ticker} sector: {sector or 'unknown'}", sector
+
+
 def analyze_macro(ticker: str) -> AgentScore:
     """
     Flow:
-      1. Fetch the FRED macro snapshot (cached per day) and the stock's sector
-      2. Compute regime labels in code
-      3. LLM judges the impact on this sector and scores; decision is derived from the score
-      4. Confidence = agreement of rates, inflation, labor and growth labels
+      1. Agent calls get_macro_indicators (FRED snapshot, cached per day; regime labels
+         in code) and get_company_sector
+      2. LLM judges the impact on this sector and scores; decision is derived from the score
+      3. Confidence = agreement of rates, inflation, labor and growth labels
     """
-    snapshot = get_macro_snapshot()
-    sector = yf.Ticker(ticker).info.get("sector")
-    labels = _labels(snapshot)
-    labels_text = "; ".join(f"{k}: {v}" for k, v in labels.items())
-
-    user_prompt = f"""Assess the macro backdrop for {ticker} (sector: {sector or "unknown"}).
-
-{_format_snapshot(snapshot)}
-
-Computed assessment (facts): {labels_text}"""
-
-    llm = ChatOpenAI(model=config.LLM_MODEL_AGENTS, temperature=config.LLM_TEMPERATURE_AGENTS)
-    analysis: MacroAnalysis = llm.with_structured_output(MacroAnalysis).invoke(
-        [
-            {"role": "system", "content": load_prompt("macro")},
-            {"role": "user", "content": user_prompt},
-        ],
-        config={"run_name": "Macro Agent"},
+    analysis, artifacts = run_tool_agent(
+        "macro",
+        [get_macro_indicators, get_company_sector],
+        MacroAnalysis,
+        f"Assess the macro backdrop for {ticker}.",
     )
-
+    labels, sector = artifacts["get_macro_indicators"], artifacts["get_company_sector"]
+    labels_text = "; ".join(f"{k}: {v}" for k, v in labels.items())
     signals = [SIGNALS[labels[k]] for k in ("rates", "inflation", "labor", "growth")]
 
     parts = [analysis.reasoning, labels_text[0].upper() + labels_text[1:] + "."]

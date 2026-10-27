@@ -2,19 +2,20 @@
 src/analysts/technical.py
 Technical Analyst Agent (price and volume)
 
-Trend, momentum and volume labels are computed in code from the technical
-snapshot and given to the LLM as facts; the LLM judges the overall setup
-(e.g. whether a move is confirmed by volume, or stretched) and scores.
+The LLM runs as a tool-calling agent: it calls get_technical_indicators, which
+fetches the snapshot and returns the indicators plus trend, momentum and volume
+labels computed in code (facts). The LLM judges the overall setup (e.g. whether
+a move is confirmed by volume, or stretched) and scores.
 Errors propagate to the caller.
 """
 
 from __future__ import annotations
 
-from langchain_openai import ChatOpenAI
+from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
-from src.agent.knowledge import load_prompt
 from src.agent.scoring import AgentScore, compute_confidence, decision_from_score
+from src.agent.tool_agent import run_tool_agent
 from src.tools.technical import TechnicalSnapshot, get_technical_snapshot
 
 from .. import config
@@ -98,16 +99,38 @@ def _format_snapshot(s: TechnicalSnapshot) -> str:
     return "\n".join(f"  {label}: {_fmt(value, kind)}" for label, value, kind in rows)
 
 
+@tool(response_format="content_and_artifact")
+def get_technical_indicators(ticker: str) -> tuple[str, dict | None]:
+    """Fetch daily price/volume indicators for a stock ticker, with trend, momentum,
+    volume and RSI-zone labels computed in code. Treat all of it as facts."""
+    snapshot = get_technical_snapshot(ticker)
+    if snapshot is None:
+        return f"No price history available for {ticker}.", None
+
+    signals = {"trend": _trend(snapshot), "momentum": _momentum(snapshot), "volume": _volume(snapshot)}
+    labels = {k: "not assessable" if v is None else LABELS[k][1 - v] for k, v in signals.items()}
+    labels_text = "; ".join(f"{k}: {v}" for k, v in labels.items()) + f"; RSI zone: {_rsi_zone(snapshot)}"
+    content = f"""{ticker} ({snapshot.trading_days} trading days of history)
+
+{_format_snapshot(snapshot)}
+
+Computed assessment (facts): {labels_text}"""
+    return content, {"signals": signals, "labels_text": labels_text}
+
+
 def analyze_technical(ticker: str) -> AgentScore:
     """
     Flow:
-      1. Fetch price/volume history and compute indicators (tools/technical.py)
-      2. Compute trend, momentum and volume labels in code
-      3. LLM judges the setup and scores; decision is derived from the score
-      4. Confidence = label coverage x agreement of trend, momentum and volume
+      1. Agent calls get_technical_indicators (snapshot from tools/technical.py,
+         trend, momentum and volume labels computed in code)
+      2. LLM judges the setup and scores; decision is derived from the score
+      3. Confidence = label coverage x agreement of trend, momentum and volume
     """
-    snapshot = get_technical_snapshot(ticker)
-    if snapshot is None:
+    analysis, artifacts = run_tool_agent(
+        "technical", [get_technical_indicators], TechnicalAnalysis, f"Assess the technical setup of {ticker}."
+    )
+    artifact = artifacts["get_technical_indicators"]
+    if artifact is None:
         return AgentScore(
             agent="technical",
             symbol=ticker,
@@ -119,25 +142,7 @@ def analyze_technical(ticker: str) -> AgentScore:
             data_gaps=["No price history from yfinance"],
         )
 
-    signals = {"trend": _trend(snapshot), "momentum": _momentum(snapshot), "volume": _volume(snapshot)}
-    labels = {k: "not assessable" if v is None else LABELS[k][1 - v] for k, v in signals.items()}
-    labels_text = "; ".join(f"{k}: {v}" for k, v in labels.items()) + f"; RSI zone: {_rsi_zone(snapshot)}"
-
-    user_prompt = f"""Assess the technical setup of {ticker} ({snapshot.trading_days} trading days of history).
-
-{_format_snapshot(snapshot)}
-
-Computed assessment (facts): {labels_text}"""
-
-    llm = ChatOpenAI(model=config.LLM_MODEL_AGENTS, temperature=config.LLM_TEMPERATURE_AGENTS)
-    analysis: TechnicalAnalysis = llm.with_structured_output(TechnicalAnalysis).invoke(
-        [
-            {"role": "system", "content": load_prompt("technical")},
-            {"role": "user", "content": user_prompt},
-        ],
-        config={"run_name": "Technical Agent"},
-    )
-
+    signals, labels_text = artifact["signals"], artifact["labels_text"]
     available = [v for v in signals.values() if v is not None]
     data_gaps = [f"{k} not assessable (short history)" for k, v in signals.items() if v is None]
 

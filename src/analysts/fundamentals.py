@@ -3,19 +3,19 @@ src/analysts/fundamentals.py
 Fundamentals Analyst Agent
 
 Scores valuation, profitability and financial health from yfinance ratios.
-The three labels are computed in code (config.FUNDAMENTALS_RULES) and given
-to the LLM as facts; the LLM weighs them in the sector context and scores.
+The agent calls get_fundamentals, which returns the ratios and three labels
+computed in code (config.FUNDAMENTALS_RULES) as facts; the LLM weighs them in the sector context and scores.
 Growth is used only to judge valuation; the growth trend and earnings
 quality belong to the earnings analyst. Errors propagate to the caller.
 """
 
 from __future__ import annotations
 
-from langchain_openai import ChatOpenAI
+from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
-from src.agent.knowledge import load_prompt
 from src.agent.scoring import AgentScore, compute_confidence, decision_from_score
+from src.agent.tool_agent import run_tool_agent
 from src.tools.market import Fundamentals, get_ticker_snapshot
 
 from .. import config
@@ -99,19 +99,45 @@ def _format_metrics(fundamentals: Fundamentals) -> str:
     return "\n".join(lines)
 
 
-def analyze_fundamentals(ticker: str) -> AgentScore:
-    """
-    Flow:
-      1. Fetch the yfinance snapshot (profile + fundamentals)
-      2. Compute valuation / profitability / health labels from rule votes
-      3. LLM produces a structured score; decision is derived from the score
-      4. Confidence = metric coverage x agreement of the three labels
-    """
+@tool(response_format="content_and_artifact")
+def get_fundamentals(ticker: str) -> tuple[str, dict | None]:
+    """Fetch the company profile and valuation, profitability and financial-health ratios
+    for a stock ticker, with labels for each area computed in code. Treat all of it as facts."""
     snapshot = get_ticker_snapshot(ticker)
     fundamentals = snapshot.fundamentals
 
     data_gaps = [label for field, label, _ in METRICS if getattr(fundamentals, field) is None]
     if len(data_gaps) == len(METRICS):
+        return f"No fundamentals data available for {ticker}.", None
+
+    signals = _area_signals(fundamentals)
+    labels = {area: _label(area, signal) for area, signal in signals.items()}
+    labels_text = "; ".join(f"{area.replace('_', ' ')}: {label}" for area, label in labels.items())
+
+    profile = snapshot.profile
+    market_cap = f"{profile.market_cap / 1e9:,.1f}B" if profile.market_cap else "n/a"
+    content = f"""{ticker} ({profile.name})
+Sector: {profile.sector or "n/a"}; industry: {profile.industry or "n/a"}; market cap: {market_cap}
+
+{_format_metrics(fundamentals)}
+
+Computed assessment (facts): {labels_text}"""
+    return content, {"signals": signals, "labels_text": labels_text, "data_gaps": data_gaps}
+
+
+def analyze_fundamentals(ticker: str) -> AgentScore:
+    """
+    Flow:
+      1. Agent calls get_fundamentals (yfinance snapshot; valuation / profitability /
+         health labels from rule votes in code)
+      2. LLM produces a structured score; decision is derived from the score
+      3. Confidence = metric coverage x agreement of the three labels
+    """
+    analysis, artifacts = run_tool_agent(
+        "fundamentals", [get_fundamentals], FundamentalsAnalysis, f"Analyze the fundamentals of {ticker}."
+    )
+    artifact = artifacts["get_fundamentals"]
+    if artifact is None:
         return AgentScore(
             agent="fundamentals",
             symbol=ticker,
@@ -123,28 +149,7 @@ def analyze_fundamentals(ticker: str) -> AgentScore:
             data_gaps=["No fundamentals data from yfinance"],
         )
 
-    signals = _area_signals(fundamentals)
-    labels = {area: _label(area, signal) for area, signal in signals.items()}
-    labels_text = "; ".join(f"{area.replace('_', ' ')}: {label}" for area, label in labels.items())
-
-    profile = snapshot.profile
-    market_cap = f"{profile.market_cap / 1e9:,.1f}B" if profile.market_cap else "n/a"
-    user_prompt = f"""Analyze the fundamentals of {ticker} ({profile.name}).
-Sector: {profile.sector or "n/a"}; industry: {profile.industry or "n/a"}; market cap: {market_cap}
-
-{_format_metrics(fundamentals)}
-
-Computed assessment (facts): {labels_text}"""
-
-    llm = ChatOpenAI(model=config.LLM_MODEL_AGENTS, temperature=config.LLM_TEMPERATURE_AGENTS)
-    analysis: FundamentalsAnalysis = llm.with_structured_output(FundamentalsAnalysis).invoke(
-        [
-            {"role": "system", "content": load_prompt("fundamentals")},
-            {"role": "user", "content": user_prompt},
-        ],
-        config={"run_name": "Fundamentals Agent"},
-    )
-
+    signals, labels_text, data_gaps = artifact["signals"], artifact["labels_text"], artifact["data_gaps"]
     coverage = 1 - len(data_gaps) / len(METRICS)
 
     parts = [analysis.reasoning, labels_text[0].upper() + labels_text[1:] + "."]

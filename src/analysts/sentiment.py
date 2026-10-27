@@ -2,8 +2,9 @@
 src/analysts/sentiment.py
 Sentiment Analyst Agent (retail sentiment and attention)
 
-Sources, each optional (a failure is logged with its stack trace and recorded
-as a data gap; the analysis continues with the rest):
+Each source is a tool the agent calls; each is optional (a failure is logged
+with its stack trace and recorded as a data gap; the analysis continues with
+the rest):
   - StockTwits posts: tag counts (code) and text tone (LLM)
   - Attention: ApeWisdom mention counts, StockTwits trending
   - Polymarket: non-price prediction markets, as context
@@ -16,13 +17,13 @@ from __future__ import annotations
 
 from typing import Callable, Literal, TypeVar
 
-from langchain_openai import ChatOpenAI
+from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
-from src.agent.knowledge import load_prompt
 from src.agent.scoring import AgentScore, compute_confidence, decision_from_score
-from src.tools.polymarket import PolymarketMarket, fetch_polymarket_markets
+from src.agent.tool_agent import run_tool_agent
 from src.tools.apewisdom import ApeWisdomMention, fetch_mentions
+from src.tools.polymarket import fetch_polymarket_markets
 from src.tools.stocktwits import StockTwitsSentiment, fetch_stocktwits_sentiment, fetch_stocktwits_trending
 from src.utils.logger import get_logger
 
@@ -75,50 +76,86 @@ def _attention_label(mentions: ApeWisdomMention | None) -> str:
     return "rising" if change > band else "falling" if change < -band else "stable"
 
 
-def _format_context(
-    st: StockTwitsSentiment | None,
-    mentions: ApeWisdomMention | None,
-    trending: bool | None,
-    markets: list[PolymarketMarket] | None,
-) -> str:
+@tool(response_format="content_and_artifact")
+def get_stocktwits_posts(ticker: str) -> tuple[str, dict]:
+    """Fetch the latest StockTwits posts for a stock ticker: bullish/bearish tag counts with
+    a tagged-sentiment label computed in code (fact), and recent post texts."""
+    gaps: list[str] = []
+    st = _fetch("StockTwits posts", fetch_stocktwits_sentiment, ticker.upper(), gaps)
+    tag = _tag_label(st)
+    artifact = {"available": st is not None, "tag": tag, "gaps": gaps}
+    if st is None:
+        return f"StockTwits posts unavailable for {ticker}.", artifact
+    lines = [
+        f"StockTwits latest {st.bullish + st.bearish + st.untagged} posts: "
+        f"{st.bullish} tagged bullish, {st.bearish} tagged bearish, {st.untagged} untagged",
+        f"Tagged sentiment (fact): {tag or 'not assessable (too few tagged posts)'}",
+    ]
+    lines += [f"  - {m[:200]}" for m in st.messages[: config.SENTIMENT_MESSAGES_FOR_LLM]]
+    return "\n".join(lines), artifact
+
+
+@tool(response_format="content_and_artifact")
+def get_forum_attention(ticker: str) -> tuple[str, dict]:
+    """Fetch ApeWisdom mention rank and 24h mention change on stock discussion forums for a
+    stock ticker, with an attention label computed in code (fact)."""
+    gaps: list[str] = []
+    mentions = _fetch("ApeWisdom mentions", fetch_mentions, ticker.upper(), gaps)
+    attention = _attention_label(mentions)
     lines = []
-    if st is not None:
-        lines.append(
-            f"StockTwits latest {st.bullish + st.bearish + st.untagged} posts: "
-            f"{st.bullish} tagged bullish, {st.bearish} tagged bearish, {st.untagged} untagged"
-        )
-        lines += [f"  - {m[:200]}" for m in st.messages[: config.SENTIMENT_MESSAGES_FOR_LLM]]
     if mentions is not None:
         lines.append(
             f"ApeWisdom: rank {mentions.rank}, {mentions.mentions} mentions in 24h "
             f"(prior 24h: {mentions.mentions_24h_ago}), rank 24h ago: {mentions.rank_24h_ago or 'n/a'}"
         )
-    if trending is not None:
-        lines.append(f"Trending on StockTwits now: {'yes' if trending else 'no'}")
-    if markets:
-        lines.append("Polymarket (probability of the stated outcome):")
-        lines += [f"  - {m.question} {m.outcome}: {m.probability:.0%}" for m in markets]
-    return "\n".join(lines)
+    lines.append(f"ApeWisdom attention (fact): {attention}")
+    return "\n".join(lines), {"attention": attention, "gaps": gaps}
+
+
+@tool(response_format="content_and_artifact")
+def get_stocktwits_trending_status(ticker: str) -> tuple[str, dict]:
+    """Check whether a stock ticker is trending on StockTwits now."""
+    gaps: list[str] = []
+    trending_list = _fetch("StockTwits trending", lambda _: fetch_stocktwits_trending(), ticker, gaps)
+    if trending_list is None:
+        return "StockTwits trending unavailable.", {"gaps": gaps}
+    trending = ticker.upper() in {t.symbol for t in trending_list}
+    return f"Trending on StockTwits now: {'yes' if trending else 'no'}", {"gaps": gaps}
+
+
+@tool(response_format="content_and_artifact")
+def get_prediction_markets(ticker: str) -> tuple[str, dict]:
+    """Fetch non-price Polymarket prediction markets about a company (e.g. earnings beat,
+    leadership, product launches) with the probability of the stated outcome."""
+    gaps: list[str] = []
+    markets = _fetch("Polymarket", fetch_polymarket_markets, ticker.upper(), gaps)
+    artifact = {"available": bool(markets), "gaps": gaps}
+    if not markets:
+        return f"No Polymarket markets for {ticker}.", artifact
+    lines = ["Polymarket (probability of the stated outcome):"]
+    lines += [f"  - {m.question} {m.outcome}: {m.probability:.0%}" for m in markets]
+    return "\n".join(lines), artifact
+
+
+TOOLS = [get_stocktwits_posts, get_forum_attention, get_stocktwits_trending_status, get_prediction_markets]
 
 
 def analyze_sentiment(ticker: str) -> AgentScore:
     """
     Flow:
-      1. Fetch each source independently (failures become data gaps)
-      2. Compute tagged-sentiment and attention labels in code
-      3. LLM reads post tone and scores; decision is derived from the score
-      4. Confidence = coverage x agreement of tagged sentiment and text tone
+      1. Agent calls each source tool (failures become data gaps); tagged-sentiment
+         and attention labels are computed in code
+      2. LLM reads post tone and scores; decision is derived from the score
+      3. Confidence = coverage x agreement of tagged sentiment and text tone
     """
     ticker = ticker.upper()
-    data_gaps: list[str] = []
+    analysis, artifacts = run_tool_agent(
+        "sentiment", TOOLS, SentimentAnalysis, f"Assess retail sentiment for {ticker}."
+    )
+    data_gaps = [gap for t in TOOLS for gap in artifacts[t.name]["gaps"]]
+    stocktwits, markets = artifacts["get_stocktwits_posts"], artifacts["get_prediction_markets"]
 
-    st = _fetch("StockTwits posts", fetch_stocktwits_sentiment, ticker, data_gaps)
-    mentions = _fetch("ApeWisdom mentions", fetch_mentions, ticker, data_gaps)
-    trending_list = _fetch("StockTwits trending", lambda _: fetch_stocktwits_trending(), ticker, data_gaps)
-    markets = _fetch("Polymarket", fetch_polymarket_markets, ticker, data_gaps)
-    trending = None if trending_list is None else ticker in {t.symbol for t in trending_list}
-
-    if st is None and not markets:
+    if not stocktwits["available"] and not markets["available"]:
         return AgentScore(
             agent="sentiment",
             symbol=ticker,
@@ -130,26 +167,11 @@ def analyze_sentiment(ticker: str) -> AgentScore:
             data_gaps=data_gaps,
         )
 
-    tag, attention = _tag_label(st), _attention_label(mentions)
+    tag, attention = stocktwits["tag"], artifacts["get_forum_attention"]["attention"]
     labels_text = (
         f"tagged sentiment: {tag or 'not assessable (too few tagged posts)'}; "
         f"ApeWisdom attention: {attention}"
     )
-    user_prompt = f"""Assess retail sentiment for {ticker}.
-
-{_format_context(st, mentions, trending, markets)}
-
-Computed assessment (facts): {labels_text}"""
-
-    llm = ChatOpenAI(model=config.LLM_MODEL_AGENTS, temperature=config.LLM_TEMPERATURE_AGENTS)
-    analysis: SentimentAnalysis = llm.with_structured_output(SentimentAnalysis).invoke(
-        [
-            {"role": "system", "content": load_prompt("sentiment")},
-            {"role": "user", "content": user_prompt},
-        ],
-        config={"run_name": "Sentiment Agent"},
-    )
-
     signals = [SIGNALS[v] for v in (tag, analysis.text_tone) if v in SIGNALS]
 
     parts = [analysis.reasoning, f"{labels_text[0].upper() + labels_text[1:]}; text tone: {analysis.text_tone}."]

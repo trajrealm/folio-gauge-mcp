@@ -3,8 +3,8 @@ src/analysts/peers.py
 Peers Analyst Agent
 
 Compares a company with named competitors (peer median from tools/peers.py).
-Relative valuation and quality labels are computed in code and given to the
-LLM as facts; the LLM judges whether a premium is justified and scores.
+The agent calls get_peer_comparison, which returns the comparison and the
+relative valuation and quality labels computed in code (facts); the LLM judges whether a premium is justified and scores.
 Errors propagate to the caller.
 """
 
@@ -12,11 +12,11 @@ from __future__ import annotations
 
 from statistics import median
 
-from langchain_openai import ChatOpenAI
+from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
-from src.agent.knowledge import load_prompt
 from src.agent.scoring import AgentScore, compute_confidence, decision_from_score
+from src.agent.tool_agent import run_tool_agent
 from src.tools.market import Fundamentals
 from src.tools.peers import QUALITY_METRICS, PeerComparison, compare_to_peers
 
@@ -91,17 +91,48 @@ def _format_comparison(comparison: PeerComparison) -> str:
     return "\n".join(lines)
 
 
+@tool(response_format="content_and_artifact")
+def get_peer_comparison(ticker: str) -> tuple[str, dict | None]:
+    """Fetch valuation and quality metrics of a stock and its peers, the peer median and
+    the stock's premium to it, with relative valuation and quality labels computed in code.
+    Treat all of it as facts."""
+    comparison = compare_to_peers(ticker)
+    if not comparison.peers:
+        return f"No peers found for {ticker}.", None
+
+    valuation, quality = _relative_valuation(comparison), _relative_quality(comparison)
+    labels_text = (
+        f"valuation vs peers: {valuation or 'not assessable'}; "
+        f"quality vs peers: {quality or 'not assessable'}"
+    )
+    profile = comparison.target.profile
+    content = f"""{ticker} ({profile.name})
+Sector: {profile.sector or "n/a"}; industry: {profile.industry or "n/a"}
+
+{_format_comparison(comparison)}
+
+Computed assessment (facts): {labels_text}"""
+    artifact = {
+        "peers": [p.profile.symbol for p in comparison.peers],
+        "signals": [SIGNALS[v] for v in (valuation, quality) if v is not None],
+        "labels_text": labels_text,
+    }
+    return content, artifact
+
+
 def analyze_peers(ticker: str) -> AgentScore:
     """
     Flow:
-      1. Find peers and compute the peer median (tools/peers.py)
-      2. Compute relative valuation and quality labels in code
-      3. LLM judges whether a premium is justified and scores; decision is derived from the score
-      4. Confidence = peer coverage x agreement of valuation and quality
+      1. Agent calls get_peer_comparison (peers and peer median from tools/peers.py;
+         relative valuation and quality labels in code)
+      2. LLM judges whether a premium is justified and scores; decision is derived from the score
+      3. Confidence = peer coverage x agreement of valuation and quality
     """
-    comparison = compare_to_peers(ticker)
-
-    if not comparison.peers:
+    analysis, artifacts = run_tool_agent(
+        "peers", [get_peer_comparison], PeersAnalysis, f"Compare {ticker} with its peers."
+    )
+    artifact = artifacts["get_peer_comparison"]
+    if artifact is None:
         return AgentScore(
             agent="peers",
             symbol=ticker,
@@ -113,36 +144,12 @@ def analyze_peers(ticker: str) -> AgentScore:
             data_gaps=["No peers found"],
         )
 
-    valuation, quality = _relative_valuation(comparison), _relative_quality(comparison)
-    labels_text = (
-        f"valuation vs peers: {valuation or 'not assessable'}; "
-        f"quality vs peers: {quality or 'not assessable'}"
-    )
-
-    profile = comparison.target.profile
-    user_prompt = f"""Compare {ticker} ({profile.name}) with its peers.
-Sector: {profile.sector or "n/a"}; industry: {profile.industry or "n/a"}
-
-{_format_comparison(comparison)}
-
-Computed assessment (facts): {labels_text}"""
-
-    llm = ChatOpenAI(model=config.LLM_MODEL_AGENTS, temperature=config.LLM_TEMPERATURE_AGENTS)
-    analysis: PeersAnalysis = llm.with_structured_output(PeersAnalysis).invoke(
-        [
-            {"role": "system", "content": load_prompt("peers")},
-            {"role": "user", "content": user_prompt},
-        ],
-        config={"run_name": "Peers Agent"},
-    )
-
-    coverage = len(comparison.peers) / config.PEERS_COUNT
-    signals = [SIGNALS[v] for v in (valuation, quality) if v is not None]
+    peers, labels_text = artifact["peers"], artifact["labels_text"]
+    coverage = len(peers) / config.PEERS_COUNT
 
     parts = [
         analysis.reasoning,
-        f"Peers: {', '.join(p.profile.symbol for p in comparison.peers)}. "
-        f"{labels_text[0].upper() + labels_text[1:]}.",
+        f"Peers: {', '.join(peers)}. {labels_text[0].upper() + labels_text[1:]}.",
     ]
     if analysis.key_signals:
         parts.append("Key signals: " + ", ".join(analysis.key_signals) + ".")
@@ -150,8 +157,8 @@ Computed assessment (facts): {labels_text}"""
         parts.append("Risks: " + ", ".join(analysis.risk_flags) + ".")
 
     data_gaps = []
-    if len(comparison.peers) < config.PEERS_COUNT:
-        data_gaps.append(f"Only {len(comparison.peers)} peers found")
+    if len(peers) < config.PEERS_COUNT:
+        data_gaps.append(f"Only {len(peers)} peers found")
 
     return AgentScore(
         agent="peers",
@@ -160,6 +167,6 @@ Computed assessment (facts): {labels_text}"""
         score=analysis.score,
         timeframe="mid",
         reasoning="Peers: " + " ".join(parts),
-        confidence=compute_confidence(coverage, signals),
+        confidence=compute_confidence(coverage, artifact["signals"]),
         data_gaps=data_gaps,
     )

@@ -2,9 +2,10 @@
 src/analysts/news.py
 News Analyst Agent
 
-The LLM classifies each recent article (relevance, sentiment, materiality),
-a text task. Code then computes net sentiment, score and confidence from
-those labels, so the score is traceable to the articles behind it.
+The agent calls get_news_articles and classifies each recent article
+(relevance, sentiment, materiality), a text task. Code then computes net
+sentiment, score and confidence from those labels, so the score is
+traceable to the articles behind it.
 Errors propagate to the caller.
 """
 
@@ -12,11 +13,11 @@ from __future__ import annotations
 
 from typing import Literal
 
-from langchain_openai import ChatOpenAI
+from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
-from src.agent.knowledge import load_prompt
 from src.agent.scoring import AgentScore, compute_confidence, decision_from_score
+from src.agent.tool_agent import run_tool_agent
 from src.tools.news import NewsArticle, get_ticker_news
 
 from .. import config
@@ -86,29 +87,34 @@ def _neutral(ticker: str, reasoning: str, data_gaps: list[str]) -> AgentScore:
     )
 
 
+@tool(response_format="content_and_artifact")
+def get_news_articles(ticker: str) -> tuple[str, dict]:
+    """Fetch recent news articles about a stock ticker as a numbered list, newest first."""
+    feed = get_ticker_news(ticker)
+    artifact = {"count": len(feed.articles), "failed_sources": feed.failed_sources}
+    if not feed.articles:
+        return f"No news for {ticker} in the last {config.NEWS_MAX_AGE_DAYS} days.", artifact
+    return _format_articles(feed.articles), artifact
+
+
 def analyze_news(ticker: str) -> AgentScore:
     """
     Flow:
-      1. Fetch recent articles (tools/news.py)
+      1. Agent calls get_news_articles (tools/news.py)
       2. LLM labels each article and summarizes the catalysts
       3. Code computes net sentiment (high materiality counts double) -> score
       4. Confidence = relevant coverage x agreement of high-materiality and overall direction
     """
-    feed = get_ticker_news(ticker)
-    data_gaps = [f"News feed unavailable: {s}" for s in feed.failed_sources]
-    if not feed.articles:
+    result, artifacts = run_tool_agent(
+        "news", [get_news_articles], NewsClassification, f"Classify the recent news articles for {ticker}."
+    )
+    feed = artifacts["get_news_articles"]
+    count = feed["count"]
+    data_gaps = [f"News feed unavailable: {s}" for s in feed["failed_sources"]]
+    if not count:
         return _neutral(ticker, f"No news in the last {config.NEWS_MAX_AGE_DAYS} days", data_gaps + ["No recent news"])
 
-    llm = ChatOpenAI(model=config.LLM_MODEL_AGENTS, temperature=config.LLM_TEMPERATURE_AGENTS)
-    result: NewsClassification = llm.with_structured_output(NewsClassification).invoke(
-        [
-            {"role": "system", "content": load_prompt("news")},
-            {"role": "user", "content": f"Classify these articles for {ticker}:\n\n{_format_articles(feed.articles)}"},
-        ],
-        config={"run_name": "News Agent"},
-    )
-
-    relevant = [a for a in result.articles if a.relevant and 0 <= a.index < len(feed.articles)]
+    relevant = [a for a in result.articles if a.relevant and 0 <= a.index < count]
     if not relevant:
         return _neutral(ticker, "No relevant news", data_gaps + ["No relevant news"])
 
@@ -117,7 +123,7 @@ def analyze_news(ticker: str) -> AgentScore:
     signals = [s for s in (_band(net), _band(_net(high))) if s is not None]
     counts = {s: sum(a.sentiment == s for a in relevant) for s in SENTIMENT}
     facts = (
-        f"{len(relevant)} relevant of {len(feed.articles)} articles "
+        f"{len(relevant)} relevant of {count} articles "
         f"({counts['positive']} positive, {counts['neutral']} neutral, {counts['negative']} negative; "
         f"{len(high)} high materiality); net sentiment {net:+.2f}."
     )

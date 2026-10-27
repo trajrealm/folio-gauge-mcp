@@ -2,7 +2,7 @@
 src/analysts/earnings.py
 Earnings Analyst Agent
 
-Combines two SEC sources:
+Combines two SEC sources, each a tool the agent calls:
   1. Numbers from XBRL company facts: annual and quarterly EPS, revenue and
      net income with YoY growth, plus operating cash flow / net income.
   2. Narrative via RAG: MD&A of the latest 10-K and 10-Q and recent earnings
@@ -17,11 +17,11 @@ from __future__ import annotations
 from datetime import date
 from typing import Literal
 
-from langchain_openai import ChatOpenAI
+from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
-from src.agent.knowledge import load_prompt
 from src.agent.scoring import AgentScore, compute_confidence, decision_from_score
+from src.agent.tool_agent import run_tool_agent
 from src.tools.edgar import EarningsFacts, get_earnings_facts, ingest_filings, query_filings
 
 from .. import config
@@ -166,26 +166,68 @@ def _retrieve_narrative(symbol: str) -> dict[str, str]:
     return sections
 
 
+@tool(response_format="content_and_artifact")
+def get_reported_financials(ticker: str) -> tuple[str, dict]:
+    """Fetch reported annual and quarterly EPS, revenue, net income (with YoY growth) and cash
+    conversion from SEC XBRL filings for a stock ticker, oldest to newest, with EPS trend,
+    quarterly momentum and earnings-quality labels computed in code. Treat all of it as facts."""
+    facts = get_earnings_facts(ticker)
+    eps_trend, momentum, quality = _eps_trend(facts), _momentum(facts), _cash_quality(facts)
+    labels_text = (
+        f"EPS trend (latest annual YoY): {eps_trend or 'not assessable'}; "
+        f"quarterly momentum (latest quarter vs annual EPS YoY): {momentum or 'not assessable'}; "
+        f"earnings quality (cash conversion): {quality or 'not assessable'}"
+    )
+    artifact = {
+        "available": bool(facts.annual),
+        "labels": (eps_trend, momentum, quality),
+        "labels_text": labels_text,
+    }
+    if not facts.annual:
+        return "No US-GAAP XBRL financials (foreign filers report IFRS on 20-F).", artifact
+    content = f"""=== Reported financials (XBRL) ===
+{_format_financials(facts)}
+
+Computed assessment (facts): {labels_text}"""
+    return content, artifact
+
+
+@tool(response_format="content_and_artifact")
+def get_filing_narrative(ticker: str) -> tuple[str, list[str]]:
+    """Retrieve passages on guidance, drivers and one-time items from the latest 10-K and 10-Q
+    MD&A and recent earnings press releases (8-K) for a stock ticker."""
+    ingest_filings(ticker)
+    narrative = _retrieve_narrative(ticker)
+    missing = [f"No {t} narrative retrieved" for t in NARRATIVE_QUESTIONS if t not in narrative]
+    sections = [f"=== {t} excerpts ===\n{section}" for t, section in narrative.items()]
+    if missing:
+        sections.append("Data gaps: " + ", ".join(missing))
+    return "\n\n".join(sections), list(narrative)
+
+
 def analyze_earnings(ticker: str) -> AgentScore:
     """
     Flow:
-      1. Fetch XBRL financials and format them with YoY growth
-      2. Ingest new filing narrative into Qdrant and query it
-      3. Compute EPS trend, quarterly momentum and cash-conversion quality labels in code
-      4. LLM reads guidance from the narrative and scores; decision is derived from the score
-      5. Confidence = source coverage x agreement of EPS trend, momentum, guidance and quality
+      1. Agent calls get_reported_financials (XBRL financials with YoY growth; EPS trend,
+         quarterly momentum and cash-conversion quality labels in code)
+      2. Agent calls get_filing_narrative (new filings ingested into Qdrant, then queried)
+      3. LLM reads guidance from the narrative and scores; decision is derived from the score
+      4. Confidence = source coverage x agreement of EPS trend, momentum, guidance and quality
     """
+    analysis, artifacts = run_tool_agent(
+        "earnings",
+        [get_reported_financials, get_filing_narrative],
+        EarningsAnalysis,
+        f"Today is {date.today()}. Analyze {ticker}'s earnings performance and outlook from its SEC data.",
+    )
+    financials, narrative = artifacts["get_reported_financials"], artifacts["get_filing_narrative"]
+
     data_gaps: list[str] = []
-
-    facts = get_earnings_facts(ticker)
-    if not facts.annual:
+    if not financials["available"]:
         data_gaps.append("No US-GAAP XBRL financials (foreign filers report IFRS on 20-F)")
-
-    ingest_filings(ticker)
-    narrative = _retrieve_narrative(ticker)
     data_gaps += [f"No {t} narrative retrieved" for t in NARRATIVE_QUESTIONS if t not in narrative]
 
-    if not facts.annual and not narrative:
+    if not financials["available"] and not narrative:
         return AgentScore(
             agent="earnings",
             symbol=ticker,
@@ -197,42 +239,13 @@ def analyze_earnings(ticker: str) -> AgentScore:
             data_gaps=data_gaps,
         )
 
-    eps_trend, momentum, quality = _eps_trend(facts), _momentum(facts), _cash_quality(facts)
-    labels_text = (
-        f"EPS trend (latest annual YoY): {eps_trend or 'not assessable'}; "
-        f"quarterly momentum (latest quarter vs annual EPS YoY): {momentum or 'not assessable'}; "
-        f"earnings quality (cash conversion): {quality or 'not assessable'}"
-    )
-
-    context = []
-    if facts.annual:
-        context.append(f"=== Reported financials (XBRL) ===\n{_format_financials(facts)}")
-    context += [f"=== {t} excerpts ===\n{section}" for t, section in narrative.items()]
-    context_text = "\n\n".join(context)
-
-    user_prompt = f"""Today is {date.today()}. Analyze {ticker}'s earnings performance and outlook from these SEC data.
-All financials are reported actuals, oldest to newest; the last period is the most recent.
-
-{context_text}
-
-Computed assessment (facts): {labels_text}
-Data gaps: {", ".join(data_gaps) or "none"}"""
-
-    llm = ChatOpenAI(model=config.LLM_MODEL_AGENTS, temperature=config.LLM_TEMPERATURE_AGENTS)
-    analysis: EarningsAnalysis = llm.with_structured_output(EarningsAnalysis).invoke(
-        [
-            {"role": "system", "content": load_prompt("earnings")},
-            {"role": "user", "content": user_prompt},
-        ],
-        config={"run_name": "Earnings Agent"},
-    )
-
-    sources = [bool(facts.annual), *(t in narrative for t in NARRATIVE_QUESTIONS)]
+    sources = [financials["available"], *(t in narrative for t in NARRATIVE_QUESTIONS)]
     coverage = sum(sources) / len(sources)
+    eps_trend, momentum, quality = financials["labels"]
     labels = (eps_trend, momentum, analysis.guidance_signal, quality)
     signals = [SIGNALS[v] for v in labels if v in SIGNALS]
 
-    parts = [analysis.reasoning, f"{labels_text}; guidance: {analysis.guidance_signal}."]
+    parts = [analysis.reasoning, f"{financials['labels_text']}; guidance: {analysis.guidance_signal}."]
     if analysis.key_signals:
         parts.append("Key signals: " + ", ".join(analysis.key_signals) + ".")
     if analysis.risk_flags:
